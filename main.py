@@ -11,6 +11,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 import scrcpy
+from av.codec import CodecContext
+from av.error import InvalidDataError
 
 GRID_SIZE = 24
 BASE_TEMPLATE_WIDTH = 1920
@@ -18,6 +20,42 @@ BASE_TEMPLATE_HEIGHT = 1080
 
 
 logger = logging.getLogger("bad_paint_arknights")
+
+
+class SafeScrcpyClient(scrcpy.Client):
+    def _Client__stream_loop(self) -> None:
+        codec = CodecContext.create("h264", "r")
+        while self.alive:
+            try:
+                raw_h264 = self._Client__video_socket.recv(0x10000)
+                if not raw_h264:
+                    if self.alive:
+                        time.sleep(0.01)
+                    continue
+
+                packets = codec.parse(raw_h264)
+                for packet in packets:
+                    try:
+                        frames = codec.decode(packet)
+                    except InvalidDataError:
+                        if self.alive:
+                            logger.debug("Discarded malformed scrcpy video packet")
+                        continue
+
+                    for frame in frames:
+                        frame = frame.to_ndarray(format="bgr24")
+                        if self.flip:
+                            frame = cv2.flip(frame, 1)
+                        self.last_frame = frame
+                        self.resolution = (frame.shape[1], frame.shape[0])
+                        self._Client__send_to_listeners(scrcpy.EVENT_FRAME, frame)
+            except BlockingIOError:
+                time.sleep(0.01)
+                if not self.block_frame:
+                    self._Client__send_to_listeners(scrcpy.EVENT_FRAME, None)
+            except OSError:
+                if self.alive:
+                    raise
 
 
 @dataclass
@@ -130,7 +168,7 @@ class ScrcpySession:
         self._frame_lock = threading.Lock()
         self._latest_frame: np.ndarray | None = None
 
-        self.client = scrcpy.Client(device=serial, max_fps=max_fps, block_frame=False)
+        self.client = SafeScrcpyClient(device=serial, max_fps=max_fps, block_frame=False)
         self.client.add_listener(scrcpy.EVENT_FRAME, self._on_frame)
 
     def _on_frame(self, frame: np.ndarray | None) -> None:
@@ -156,7 +194,14 @@ class ScrcpySession:
 
 
 def run_command(cmd: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, check=False, capture_output=True, text=True)
+    return subprocess.run(
+        cmd,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
 
 
 def ensure_adb_connection(config: Config) -> None:
