@@ -500,44 +500,69 @@ def draw_mask_scanline(
     action_delay_sec: float,
     selected_color: str | None,
 ) -> str | None:
-    for row in range(GRID_SIZE):
-        col = 0
-        while col < GRID_SIZE:
-            if not draw_mask[row, col]:
-                col += 1
-                continue
-
-            color_name = "black" if target_grid[row, col] else "white"
-            run_start = col
-            run_end = col
-
-            col += 1
+    def _draw_scanline_runs(color_mask: np.ndarray) -> None:
+        for row in range(GRID_SIZE):
+            col = 0
             while col < GRID_SIZE:
-                if draw_mask[row, col] and (target_grid[row, col] == target_grid[row, run_start]):
-                    if col == run_end + 1:
-                        run_end = col
-                        col += 1
-                        continue
-                break
+                if not color_mask[row, col]:
+                    col += 1
+                    continue
 
-            selected_color = select_color(
-                control,
-                color_name,
-                selected_color,
-                black_cell,
-                white_cell,
-                action_delay_sec,
-            )
+                run_start = col
+                run_end = col
 
-            start_x, start_y = cell_center(canvas_rect, row, run_start)
-            end_x, end_y = cell_center(canvas_rect, row, run_end)
+                col += 1
+                while col < GRID_SIZE and color_mask[row, col] and col == run_end + 1:
+                    run_end = col
+                    col += 1
 
-            if run_start == run_end:
-                tap(control, start_x, start_y)
-            else:
-                control.swipe(start_x, start_y, end_x, end_y)
+                start_x, start_y = cell_center(canvas_rect, row, run_start)
+                end_x, end_y = cell_center(canvas_rect, row, run_end)
 
-            time.sleep(action_delay_sec)
+                if run_start == run_end:
+                    tap(control, start_x, start_y)
+                else:
+                    control.swipe(start_x, start_y, end_x, end_y)
+
+                time.sleep(action_delay_sec)
+
+    black_mask = np.logical_and(draw_mask, target_grid)
+    white_mask = np.logical_and(draw_mask, np.logical_not(target_grid))
+
+    has_black = bool(np.any(black_mask))
+    has_white = bool(np.any(white_mask))
+    if not has_black and not has_white:
+        return selected_color
+
+    # Draw by color in at most two passes and keep current color when possible.
+    phase_order: list[str] = []
+    if selected_color == "black" and has_black:
+        phase_order.append("black")
+        if has_white:
+            phase_order.append("white")
+    elif selected_color == "white" and has_white:
+        phase_order.append("white")
+        if has_black:
+            phase_order.append("black")
+    else:
+        if has_black:
+            phase_order.append("black")
+        if has_white:
+            phase_order.append("white")
+
+    for color_name in phase_order:
+        selected_color = select_color(
+            control,
+            color_name,
+            selected_color,
+            black_cell,
+            white_cell,
+            action_delay_sec,
+        )
+        if color_name == "black":
+            _draw_scanline_runs(black_mask)
+        else:
+            _draw_scanline_runs(white_mask)
 
     return selected_color
 
