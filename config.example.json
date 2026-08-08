@@ -11,7 +11,8 @@
   "emulator_serial": null,
 
   "draw_fps": 5,
-  "max_frames": null,
+  "frame_start": 0,
+  "frame_end": null,
   "frame_threshold": 127,
   "action_delay_sec": 0.08,
 

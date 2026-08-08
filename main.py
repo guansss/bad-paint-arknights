@@ -73,7 +73,8 @@ class Config:
     emulator_serial: str | None = None
 
     draw_fps: float = 5.0
-    max_frames: int | None = None
+    frame_start: int | None = None
+    frame_end: int | None = None
     frame_threshold: int = 127
     action_delay_sec: float = 0.08
 
@@ -129,8 +130,10 @@ def load_config_from_json(project_root: Path) -> Config:
 
     if "draw_fps" in data:
         config.draw_fps = float(data["draw_fps"])
-    if "max_frames" in data:
-        config.max_frames = None if data["max_frames"] is None else int(data["max_frames"])
+    if "frame_start" in data:
+        config.frame_start = None if data["frame_start"] is None else int(data["frame_start"])
+    if "frame_end" in data:
+        config.frame_end = None if data["frame_end"] is None else int(data["frame_end"])
     if "frame_threshold" in data:
         config.frame_threshold = int(data["frame_threshold"])
     if "action_delay_sec" in data:
@@ -707,9 +710,24 @@ def main() -> None:
 
     source_video = get_first_video_file(config.assets_dir)
     frame_grids = extract_sampled_grids(source_video, config.draw_fps, config.frame_threshold)
-    if config.max_frames is not None:
-        frame_grids = frame_grids[: config.max_frames]
-        logger.info("Debug frame limit enabled: processing at most %d frames", config.max_frames)
+
+    total_frame_count = len(frame_grids)
+    start_idx = 0 if config.frame_start is None else max(0, config.frame_start)
+    if config.frame_end is not None:
+        end_idx = min(total_frame_count, config.frame_end + 1)
+        if end_idx < start_idx:
+            raise ValueError("frame_end must be greater than or equal to frame_start")
+    else:
+        end_idx = total_frame_count
+
+    frame_grids = frame_grids[start_idx:end_idx]
+    if start_idx != 0 or end_idx != total_frame_count:
+        logger.info(
+            "Frame range configured: processing frames %d to %d (%d frames)",
+            start_idx,
+            end_idx - 1,
+            len(frame_grids),
+        )
     palette_template, clear_template, clear_confirm_template = load_templates(config)
 
     clear_screenshots_dir(config.screenshots_dir)
