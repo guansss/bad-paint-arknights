@@ -255,6 +255,17 @@ def clear_screenshots_dir(path: Path) -> None:
             shutil.rmtree(item)
 
 
+def clear_debug_frames_dir(debug_dir: Path) -> None:
+    frames_dir = debug_dir / "frames"
+    logger.info("Clearing debug frames directory: %s", frames_dir)
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    for item in frames_dir.iterdir():
+        if item.is_file():
+            item.unlink()
+        elif item.is_dir():
+            shutil.rmtree(item)
+
+
 def match_template_multiscale(
     image: np.ndarray,
     template: np.ndarray,
@@ -414,12 +425,19 @@ def compute_palette_cells(rect: tuple[int, int, int, int]) -> tuple[tuple[int, i
 
 
 def frame_to_grid(frame: np.ndarray, threshold: int) -> np.ndarray:
+    sampled, _ = sample_frame_for_grid(frame)
+    gray = cv2.cvtColor(sampled, cv2.COLOR_BGR2GRAY)
+    black = gray < threshold
+    return black
+
+
+def sample_frame_for_grid(frame: np.ndarray) -> tuple[np.ndarray, tuple[int, int, int, int]]:
     target = GRID_SIZE
     h, w = frame.shape[:2]
 
     scale = max(target / w, target / h)
-    resized_w = int(round(w * scale))
-    resized_h = int(round(h * scale))
+    resized_w = round(w * scale)
+    resized_h = round(h * scale)
 
     resized = cv2.resize(frame, (resized_w, resized_h), interpolation=cv2.INTER_AREA)
 
@@ -427,9 +445,12 @@ def frame_to_grid(frame: np.ndarray, threshold: int) -> np.ndarray:
     y0 = (resized_h - target) // 2
     cropped = resized[y0 : y0 + target, x0 : x0 + target]
 
-    gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
-    black = gray < threshold
-    return black
+    src_x0 = max(0, min(w - 1, round(x0 / scale)))
+    src_y0 = max(0, min(h - 1, round(y0 / scale)))
+    src_x1 = max(src_x0 + 1, min(w, round((x0 + target) / scale)))
+    src_y1 = max(src_y0 + 1, min(h, round((y0 + target) / scale)))
+
+    return cropped, (src_x0, src_y0, src_x1, src_y1)
 
 
 def cell_center(canvas_rect: tuple[int, int, int, int], row: int, col: int) -> tuple[int, int]:
@@ -560,7 +581,9 @@ def clear_canvas(
     logger.info("Canvas cleared successfully")
 
 
-def extract_sampled_grids(video_path: Path, target_fps: float, threshold: int) -> list[np.ndarray]:
+def extract_sampled_frames_and_grids(
+    video_path: Path, target_fps: float, threshold: int
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
     logger.info("Sampling source video at %.2f fps", target_fps)
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
@@ -570,7 +593,7 @@ def extract_sampled_grids(video_path: Path, target_fps: float, threshold: int) -
     if source_fps <= 0:
         source_fps = target_fps
 
-    sampled: list[np.ndarray] = []
+    sampled: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
     next_sample_time = 0.0
     target_step = 1.0 / target_fps
     frame_idx = 0
@@ -582,7 +605,10 @@ def extract_sampled_grids(video_path: Path, target_fps: float, threshold: int) -
 
         frame_time = frame_idx / source_fps
         if frame_time + 1e-6 >= next_sample_time:
-            sampled.append(frame_to_grid(frame, threshold))
+            sampled_frame, _ = sample_frame_for_grid(frame)
+            gray = cv2.cvtColor(sampled_frame, cv2.COLOR_BGR2GRAY)
+            grid = gray < threshold
+            sampled.append((frame.copy(), sampled_frame, grid))
             next_sample_time += target_step
 
         frame_idx += 1
@@ -602,6 +628,51 @@ def write_frame_image(path: Path, frame_bgr: np.ndarray) -> None:
     ok = cv2.imwrite(str(path), frame_bgr)
     if not ok:
         raise RuntimeError(f"Failed to write screenshot: {path}")
+
+
+def save_frame_comparison_debug_image(
+    debug_dir: Path,
+    frame_index: int,
+    source_frame: np.ndarray,
+    sampled_frame: np.ndarray,
+    screenshot_frame: np.ndarray,
+    canvas_rect: tuple[int, int, int, int],
+) -> None:
+    x, y, w, h = canvas_rect
+
+    sx0 = max(0, x)
+    sy0 = max(0, y)
+    sx1 = min(screenshot_frame.shape[1], x + w)
+    sy1 = min(screenshot_frame.shape[0], y + h)
+    if sx1 <= sx0 or sy1 <= sy0:
+        raise RuntimeError("Canvas crop is out of screenshot bounds")
+
+    canvas_crop = screenshot_frame[sy0:sy1, sx0:sx1]
+    target_h = canvas_crop.shape[0]
+
+    source_with_rect = source_frame.copy()
+    rx0, ry0, rx1, ry1 = sample_frame_for_grid(source_frame)[1]
+    cv2.rectangle(source_with_rect, (rx0, ry0), (rx1 - 1, ry1 - 1), (0, 255, 0), 2)
+
+    def _resize_to_height(image: np.ndarray, height: int) -> np.ndarray:
+        if image.shape[0] == height:
+            return image
+        new_w = max(1, round(image.shape[1] * (height / image.shape[0])))
+        return cv2.resize(image, (new_w, height), interpolation=cv2.INTER_AREA)
+
+    left = _resize_to_height(source_with_rect, target_h)
+    middle = _resize_to_height(sampled_frame, target_h)
+    right = _resize_to_height(canvas_crop, target_h)
+
+    separator = np.full((target_h, 3, 3), (255, 0, 0), dtype=np.uint8)
+    combined = np.hstack((left, separator, middle, separator, right))
+
+    frame_debug_dir = debug_dir / "frames"
+    frame_debug_dir.mkdir(parents=True, exist_ok=True)
+    path = frame_debug_dir / f"frame_{frame_index:06d}.png"
+    ok = cv2.imwrite(str(path), combined)
+    if not ok:
+        raise RuntimeError(f"Failed to write frame debug image: {path}")
 
 
 def source_has_audio(ffprobe_path: str, source_video: Path) -> bool:
@@ -709,9 +780,13 @@ def main() -> None:
     ensure_adb_connection(config)
 
     source_video = get_first_video_file(config.assets_dir)
-    frame_grids = extract_sampled_grids(source_video, config.draw_fps, config.frame_threshold)
+    sampled_frames = extract_sampled_frames_and_grids(
+        source_video,
+        config.draw_fps,
+        config.frame_threshold,
+    )
 
-    total_frame_count = len(frame_grids)
+    total_frame_count = len(sampled_frames)
     start_idx = 0 if config.frame_start is None else max(0, config.frame_start)
     if config.frame_end is not None:
         end_idx = min(total_frame_count, config.frame_end + 1)
@@ -720,17 +795,18 @@ def main() -> None:
     else:
         end_idx = total_frame_count
 
-    frame_grids = frame_grids[start_idx:end_idx]
+    sampled_frames = sampled_frames[start_idx:end_idx]
     if start_idx != 0 or end_idx != total_frame_count:
         logger.info(
             "Frame range configured: processing frames %d to %d (%d frames)",
             start_idx,
             end_idx - 1,
-            len(frame_grids),
+            len(sampled_frames),
         )
     palette_template, clear_template, clear_confirm_template = load_templates(config)
 
     clear_screenshots_dir(config.screenshots_dir)
+    clear_debug_frames_dir(config.debug_dir)
 
     session = ScrcpySession(serial=config.emulator_serial, max_fps=int(max(30, config.draw_fps * 2)))
     logger.info("Starting scrcpy session")
@@ -786,9 +862,9 @@ def main() -> None:
         selected_color: str | None = None
         prev_grid: np.ndarray | None = None
 
-        total_frames = len(frame_grids)
+        total_frames = len(sampled_frames)
         logger.info("Starting draw loop for %d frames", total_frames)
-        for i, grid in enumerate(frame_grids, start=1):
+        for i, (source_frame, sampled_frame, grid) in enumerate(sampled_frames, start=1):
             if prev_grid is None:
                 draw_mask = grid.copy()
                 logger.info("Frame %d/%d: initial full draw", i, total_frames)
@@ -843,6 +919,14 @@ def main() -> None:
             shot = session.get_frame(timeout_sec=config.frame_wait_timeout_sec)
             screenshot_path = config.screenshots_dir / f"frame_{i:06d}.png"
             write_frame_image(screenshot_path, shot)
+            save_frame_comparison_debug_image(
+                config.debug_dir,
+                i,
+                source_frame,
+                sampled_frame,
+                shot,
+                canvas_rect,
+            )
 
             if i == 1 or i == total_frames or i % 10 == 0:
                 logger.info("Saved screenshot for frame %d/%d", i, total_frames)
