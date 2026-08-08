@@ -1,0 +1,22 @@
+{
+  "assets_dir": "assets",
+  "templates_dir": "assets/templates",
+  "screenshots_dir": "screenshots",
+  "debug_dir": "debug",
+  "output_video_path": "output.mp4",
+
+  "adb_path": "adb",
+  "ffmpeg_path": "ffmpeg",
+  "ffprobe_path": "ffprobe",
+  "emulator_serial": null,
+
+  "draw_fps": 5,
+  "max_frames": null,
+  "frame_threshold": 127,
+  "action_delay_sec": 0.08,
+
+  "template_score_threshold": 0.55,
+  "clear_confirm_timeout_sec": 3.0,
+  "frame_wait_timeout_sec": 5.0,
+  "log_level": "INFO"
+}
