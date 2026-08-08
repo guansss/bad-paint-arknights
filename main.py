@@ -582,7 +582,8 @@ def clear_canvas(
     tap(control, clear_button_center[0], clear_button_center[1])
     time.sleep(action_delay_sec)
 
-    deadline = time.time() + confirm_timeout_sec
+    confirm_begin = time.time()
+    deadline = confirm_begin + confirm_timeout_sec
     confirm_center: tuple[int, int] | None = None
     last_frame: np.ndarray | None = None
 
@@ -602,7 +603,8 @@ def clear_canvas(
         raise RuntimeError("Clear confirmation button was not detected")
 
     tap(control, confirm_center[0], confirm_center[1])
-    time.sleep(action_delay_sec)
+    confirm_transition_duration = time.time() - confirm_begin
+    time.sleep(action_delay_sec + confirm_transition_duration)
     logger.info("Canvas cleared successfully")
 
 
