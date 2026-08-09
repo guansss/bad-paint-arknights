@@ -1654,10 +1654,12 @@ def main() -> None:
 
         selected_color: int | None = None
         prev_grid: np.ndarray | None = None
+        total_frame_process_time_sec = 0.0
 
         total_frames = len(sampled_frames)
         logger.info("Starting draw loop for %d frames", total_frames)
         for i, (source_frame, sampled_frame, grid) in enumerate(sampled_frames, start=1):
+            frame_process_start = time.perf_counter()
             if prev_grid is None:
                 draw_mask = grid != BACKGROUND_PALETTE_INDEX
                 logger.info("Frame %d/%d: initial full draw", i, total_frames)
@@ -1743,8 +1745,25 @@ def main() -> None:
                 config.source_scale_mode,
             )
 
+            frame_process_time_sec = time.perf_counter() - frame_process_start
+            total_frame_process_time_sec += frame_process_time_sec
+
             if i == 1 or i == total_frames or i % 10 == 0:
-                logger.info("Saved screenshot for frame %d/%d", i, total_frames)
+                average_frame_process_time_sec = total_frame_process_time_sec / i
+                logger.info(
+                    "Saved screenshot for frame %d/%d in %.3fs (avg %.3fs)",
+                    i,
+                    total_frames,
+                    frame_process_time_sec,
+                    average_frame_process_time_sec,
+                )
+
+        logger.info(
+            "Processed %d frames in %.3fs total (avg %.3fs)",
+            total_frames,
+            total_frame_process_time_sec,
+            total_frame_process_time_sec / total_frames if total_frames > 0 else 0.0,
+        )
 
         compile_output_video(config, source_video)
         logger.info("Automation completed successfully")
