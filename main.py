@@ -586,13 +586,8 @@ def get_first_video_file(assets_dir: Path) -> Path:
 
 
 def clear_screenshots_dir(path: Path) -> None:
-    logger.info("Clearing screenshots directory: %s", path)
+    logger.info("Ensuring screenshots directory exists: %s", path)
     path.mkdir(parents=True, exist_ok=True)
-    for item in path.iterdir():
-        if item.is_file():
-            item.unlink()
-        elif item.is_dir():
-            shutil.rmtree(item)
 
 
 def clear_debug_frames_dir(debug_dir: Path) -> None:
