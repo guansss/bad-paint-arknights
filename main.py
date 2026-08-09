@@ -1186,26 +1186,46 @@ def clear_canvas(
 ) -> None:
     logger.info("Clearing canvas")
 
-    tap(touch, clear_button_center[0], clear_button_center[1])
-    time.sleep(action_delay_sec)
-
-    confirm_begin = time.time()
-    deadline = confirm_begin + confirm_timeout_sec
+    max_attempts = 3
+    confirm_begin: float | None = None
     confirm_center: tuple[int, int] | None = None
     last_frame: np.ndarray | None = None
     latest_seq = -1
 
-    while time.time() < deadline:
-        frame, latest_seq = session.get_frame_with_seq(timeout_sec=1.0, min_seq_exclusive=latest_seq)
-        last_frame = frame
-        try:
-            x, y, w, h, _ = match_template_multiscale(frame, clear_confirm_template, score_threshold)
-            confirm_center = (x + w // 2, y + h // 2)
-            break
-        except RuntimeError:
-            time.sleep(0.05)
+    for attempt in range(1, max_attempts + 1):
+        tap(touch, clear_button_center[0], clear_button_center[1])
+        time.sleep(action_delay_sec)
 
-    if confirm_center is None:
+        confirm_begin = time.time()
+        deadline = confirm_begin + confirm_timeout_sec
+        confirm_center = None
+        last_frame = None
+
+        while time.time() < deadline:
+            frame, latest_seq = session.get_frame_with_seq(timeout_sec=1.0, min_seq_exclusive=latest_seq)
+            last_frame = frame
+            try:
+                x, y, w, h, _ = match_template_multiscale(frame, clear_confirm_template, score_threshold)
+                confirm_center = (x + w // 2, y + h // 2)
+                break
+            except RuntimeError:
+                time.sleep(0.05)
+
+        if confirm_center is not None:
+            break
+
+        if attempt < max_attempts:
+            logger.warning(
+                "Clear confirmation button was not detected on attempt %d/%d; retrying",
+                attempt,
+                max_attempts,
+            )
+        else:
+            if last_frame is not None:
+                save_debug_screenshot(debug_dir, last_frame, "detect_clear_confirm_failed")
+            raise RuntimeError("Clear confirmation button was not detected")
+
+    if confirm_center is None or confirm_begin is None:
         if last_frame is not None:
             save_debug_screenshot(debug_dir, last_frame, "detect_clear_confirm_failed")
         raise RuntimeError("Clear confirmation button was not detected")
