@@ -68,7 +68,7 @@ Before drawing, detect the interaction areas through the video stream.
 
 To detect the canvas, find the largest white square in the screen. To speed up the process, assume the canvas's side length to be at least 50% of the screen height. The canvas is "almost" uniformly white, but not perfectly white as it contains a subtle light gray background pattern.
 
-To detect the color palette, use template matching with `palette-first-row.png` to find the location of the palette. The `palette-first-row.png` image contains the first row of the palette, which is 4 grids of colors, where the leftmost grid is black and the rightmost grid is white, which are the only colors that will be used for drawing.
+To detect the color palette, use template matching with `palette-first-row.png` to find the location of the palette. The `palette-first-row.png` image contains the first row of the palette. The first row of the palette contains 4 grids of colors - black, light gray, beige, and white.
 
 To detect the "clear" button, use template matching with `clear-button.png` to find the location of the button.
 
@@ -84,15 +84,15 @@ Before each run, clear the canvas by pressing the "clear" button and confirming 
 
 For each frame, scale the image to fit the canvas' resolution simulating the behavior of `object-fit: cover` CSS property. This means that the image will be scaled to cover the entire canvas while maintaining its aspect ratio, potentially cropping parts of the image that exceed the canvas dimensions.
 
-The image will be thresholded into a binary image to determine which cells should be filled with black and which should remain white.
+The image will be converted to gray scale before drawing. Only three colors will be used for drawing: black, light gray, and white (i.e., the 1st, 2nd, and 4th colors in the palette). To determine the color of each pixel, first extract the candidate colors' actual RGB values from the detected palette, then find the closest color to the pixel's color in the frame.
 
 The image will be drawn on the canvas in a scan line order, i.e., from the top-left cell to the bottom-right cell, row by row.
 
 For an isolated pixel, simulate a tap event at the center of the corresponding cell. For a continuous line of pixels in the same row, simulate a touch event that starts at the first cell and slides to the last cell in that line.
 
-To optimize the drawing process, before drawing each frame, compare the current frame with the previous frame to determine which cells have changed. If the changed pixels are less than the pixels that are supposed to be drawn for the current frame, only draw the changed cells by swapping their colors between black and white. Otherwise, clear the canvas first (by pressing the "clear" button and confirming) and then draw all the pixels for the current frame.
+To optimize the drawing process, before drawing each frame, compare the current frame with the previous frame to determine which cells have changed. If the changed pixels are less than the pixels that are supposed to be drawn for the current frame, only draw the changed cells. Otherwise, clear the canvas first (by pressing the "clear" button and confirming) and then draw all the pixels for the current frame.
 
-To pick a color, simulate a tap event on the corresponding color grid in the palette. For black, tap on the leftmost grid of the palette, and for white, tap on the rightmost grid. Since the canvas's background is already white, only the black pixels need to be drawn, unless the previous frame had black pixels that need to be overwritten with white.
+To pick a color, simulate a tap event on the corresponding color grid in the palette. Since the canvas's background is already white, only the non-white pixels need to be drawn, unless the previous frame had non-white pixels that need to be overwritten with white.
 
 After drawing each frame, capture a frame of the video stream and save it as a screenshot in the `screenshots/` directory.
 

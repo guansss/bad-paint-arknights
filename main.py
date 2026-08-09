@@ -1,25 +1,50 @@
-import logging
 import json
+import logging
 import shutil
 import subprocess
 import threading
 import time
-from datetime import datetime, timezone
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
+
+from av.codec import CodecContext
+from av.error import InvalidDataError
 
 import cv2
 import numpy as np
 import scrcpy
-from av.codec import CodecContext
-from av.error import InvalidDataError
 
 GRID_SIZE = 24
 BASE_TEMPLATE_WIDTH = 1920
 BASE_TEMPLATE_HEIGHT = 1080
+DRAW_PALETTE_INDICES = (0, 1, 3)
+BACKGROUND_PALETTE_INDEX = 3
+VALIDATION_MAX_ATTEMPTS = 5
+DEFAULT_PALETTE_NAMES = (
+    "black",
+    "light_gray",
+    "beige",
+    "white",
+)
 
 
 logger = logging.getLogger("bad_paint_arknights")
+
+
+@dataclass(frozen=True)
+class PaletteColor:
+    index: int
+    name: str
+    center: tuple[int, int]
+    bgr: tuple[int, int, int]
+
+
+@dataclass(frozen=True)
+class TouchAction:
+    kind: str
+    start: tuple[int, int]
+    end: tuple[int, int]
 
 
 class SafeScrcpyClient(scrcpy.Client):
@@ -102,22 +127,22 @@ def load_config_from_json(project_root: Path) -> Config:
     with config_path.open("r", encoding="utf-8") as f:
         data = json.load(f)
 
-    def _path_from_value(value: str, default_path: Path) -> Path:
+    def _path_from_value(value: str) -> Path:
         p = Path(value)
         if p.is_absolute():
             return p
         return project_root / p
 
     if "assets_dir" in data:
-        config.assets_dir = _path_from_value(data["assets_dir"], config.assets_dir)
+        config.assets_dir = _path_from_value(data["assets_dir"])
     if "templates_dir" in data:
-        config.templates_dir = _path_from_value(data["templates_dir"], config.templates_dir)
+        config.templates_dir = _path_from_value(data["templates_dir"])
     if "screenshots_dir" in data:
-        config.screenshots_dir = _path_from_value(data["screenshots_dir"], config.screenshots_dir)
+        config.screenshots_dir = _path_from_value(data["screenshots_dir"])
     if "output_video_path" in data:
-        config.output_video_path = _path_from_value(data["output_video_path"], config.output_video_path)
+        config.output_video_path = _path_from_value(data["output_video_path"])
     if "debug_dir" in data:
-        config.debug_dir = _path_from_value(data["debug_dir"], config.debug_dir)
+        config.debug_dir = _path_from_value(data["debug_dir"])
 
     if "adb_path" in data:
         config.adb_path = str(data["adb_path"])
@@ -163,6 +188,59 @@ def save_debug_screenshot(debug_dir: Path, frame: np.ndarray, reason: str) -> Pa
     else:
         logger.warning("Failed to save debug screenshot: %s", path)
 
+    return path
+
+
+def save_base_debug_image(
+    debug_dir: Path,
+    frame: np.ndarray,
+    canvas_rect: tuple[int, int, int, int],
+    palette_rect: tuple[int, int, int, int],
+    clear_button_rect: tuple[int, int, int, int],
+) -> Path:
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    path = debug_dir / "base.png"
+
+    debug_frame = frame.copy()
+
+    def _draw_rect(
+        rect: tuple[int, int, int, int],
+        color: tuple[int, int, int],
+        label: str,
+    ) -> None:
+        x, y, w, h = rect
+        cv2.rectangle(debug_frame, (x, y), (x + w - 1, y + h - 1), color, 3)
+        cv2.putText(
+            debug_frame,
+            label,
+            (x, max(0, y - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+
+    def _draw_canvas_grid(rect: tuple[int, int, int, int]) -> None:
+        x, y, w, h = rect
+        for col in range(1, GRID_SIZE):
+            gx = round(x + col * w / GRID_SIZE)
+            cv2.line(debug_frame, (gx, y), (gx, y + h - 1), (0, 200, 255), 1, cv2.LINE_AA)
+
+        for row in range(1, GRID_SIZE):
+            gy = round(y + row * h / GRID_SIZE)
+            cv2.line(debug_frame, (x, gy), (x + w - 1, gy), (0, 200, 255), 1, cv2.LINE_AA)
+
+    _draw_rect(canvas_rect, (0, 255, 0), "canvas")
+    _draw_canvas_grid(canvas_rect)
+    _draw_rect(palette_rect, (255, 0, 0), "palette")
+    _draw_rect(clear_button_rect, (0, 0, 255), "clear")
+
+    ok = cv2.imwrite(str(path), debug_frame)
+    if not ok:
+        raise RuntimeError(f"Failed to write base debug image: {path}")
+
+    logger.info("Saved base debug image: %s", path)
     return path
 
 
@@ -403,6 +481,105 @@ def detect_canvas_rect(screen: np.ndarray) -> tuple[int, int, int, int]:
     if best_rect is None:
         raise RuntimeError("Failed to detect canvas: no square-like bright region found")
 
+    def _refine_canvas_rect_with_dark_border(
+        image_gray: np.ndarray,
+        coarse_rect: tuple[int, int, int, int],
+    ) -> tuple[int, int, int, int]:
+        x, y, w, h_rect = coarse_rect
+        search_margin = max(6, int(min(w, h_rect) * 0.05))
+
+        strip_trim_y = max(4, int(h_rect * 0.08))
+        strip_trim_x = max(4, int(w * 0.08))
+
+        y0 = max(0, y + strip_trim_y)
+        y1 = min(screen_h, y + h_rect - strip_trim_y)
+        x0 = max(0, x + strip_trim_x)
+        x1 = min(screen_w, x + w - strip_trim_x)
+        if y1 <= y0 or x1 <= x0:
+            return coarse_rect
+
+        def _darkest_vertical(x_start: int, x_end: int, prefer_leftmost: bool) -> int | None:
+            x_start = max(0, x_start)
+            x_end = min(screen_w - 1, x_end)
+            if x_end < x_start:
+                return None
+
+            best_x: int | None = None
+            best_val = float("inf")
+            for cx in range(x_start, x_end + 1):
+                val = float(np.mean(image_gray[y0:y1, cx]))
+                if val < best_val:
+                    best_val = val
+                    best_x = cx
+                elif val == best_val and best_x is not None:
+                    if prefer_leftmost and cx < best_x:
+                        best_x = cx
+                    if not prefer_leftmost and cx > best_x:
+                        best_x = cx
+            return best_x
+
+        def _darkest_horizontal(y_start: int, y_end: int, prefer_topmost: bool) -> int | None:
+            y_start = max(0, y_start)
+            y_end = min(screen_h - 1, y_end)
+            if y_end < y_start:
+                return None
+
+            best_y: int | None = None
+            best_val = float("inf")
+            for cy in range(y_start, y_end + 1):
+                val = float(np.mean(image_gray[cy, x0:x1]))
+                if val < best_val:
+                    best_val = val
+                    best_y = cy
+                elif val == best_val and best_y is not None:
+                    if prefer_topmost and cy < best_y:
+                        best_y = cy
+                    if not prefer_topmost and cy > best_y:
+                        best_y = cy
+            return best_y
+
+        # Outward-only snap windows: do not shrink the coarse rect.
+        left = _darkest_vertical(x - search_margin, x + 2, prefer_leftmost=True)
+        right = _darkest_vertical(x + w - 3, x + w - 1 + search_margin, prefer_leftmost=False)
+        top = _darkest_horizontal(y - search_margin, y + 2, prefer_topmost=True)
+        bottom = _darkest_horizontal(y + h_rect - 3, y + h_rect - 1 + search_margin, prefer_topmost=False)
+
+        if left is None or right is None or top is None or bottom is None:
+            return coarse_rect
+
+        left = min(left, x)
+        right = max(right, x + w - 1)
+        top = min(top, y)
+        bottom = max(bottom, y + h_rect - 1)
+
+        refined_w = right - left + 1
+        refined_h = bottom - top + 1
+        if refined_w <= 0 or refined_h <= 0:
+            return coarse_rect
+
+        return (left, top, refined_w, refined_h)
+
+    refined_rect = _refine_canvas_rect_with_dark_border(gray, best_rect)
+    if refined_rect != best_rect:
+        logger.info(
+            "Canvas refined by border snap: coarse=(%d,%d,%d,%d) refined=(%d,%d,%d,%d)",
+            best_rect[0],
+            best_rect[1],
+            best_rect[2],
+            best_rect[3],
+            refined_rect[0],
+            refined_rect[1],
+            refined_rect[2],
+            refined_rect[3],
+        )
+        best_rect = refined_rect
+
+    # the inset is recorded from a 1080p screenshot
+    inset_px = max(1, round(screen_h * (4.0 / 1080.0)))
+    bx, by, bw, bh = best_rect
+    if bw > inset_px * 2 and bh > inset_px * 2:
+        best_rect = (bx + inset_px, by + inset_px, bw - inset_px * 2, bh - inset_px * 2)
+
     logger.info(
         "Canvas detected at x=%d y=%d w=%d h=%d (threshold=%d)",
         best_rect[0],
@@ -415,20 +592,199 @@ def detect_canvas_rect(screen: np.ndarray) -> tuple[int, int, int, int]:
     return best_rect
 
 
-def compute_palette_cells(rect: tuple[int, int, int, int]) -> tuple[tuple[int, int], tuple[int, int]]:
+def sample_bgr_patch(image: np.ndarray, center: tuple[int, int], radius: int = 2) -> tuple[int, int, int]:
+    x, y = center
+    x0 = max(0, x - radius)
+    y0 = max(0, y - radius)
+    x1 = min(image.shape[1], x + radius + 1)
+    y1 = min(image.shape[0], y + radius + 1)
+    patch = image[y0:y1, x0:x1]
+    if patch.size == 0:
+        raise RuntimeError("Failed to sample palette color from screen")
+
+    mean_bgr = np.rint(patch.mean(axis=(0, 1))).astype(np.int32)
+    blue, green, red = mean_bgr.tolist()
+    return blue, green, red
+
+
+def compute_palette_colors(
+    screen: np.ndarray,
+    rect: tuple[int, int, int, int],
+    template: np.ndarray,
+) -> list[PaletteColor]:
     x, y, w, h = rect
-    cell_w = w / 4.0
+    cell_count = max(1, round(template.shape[1] / max(template.shape[0], 1)))
+    cell_w = w / float(cell_count)
     cy = int(y + h / 2.0)
-    black = (int(x + cell_w * 0.5), cy)
-    white = (int(x + cell_w * 3.5), cy)
-    return black, white
+
+    palette_colors: list[PaletteColor] = []
+    for index in range(cell_count):
+        cx = int(x + (index + 0.5) * cell_w)
+        name = DEFAULT_PALETTE_NAMES[index] if index < len(DEFAULT_PALETTE_NAMES) else f"color_{index + 1}"
+        bgr = sample_bgr_patch(screen, (cx, cy))
+        palette_colors.append(PaletteColor(index=index, name=name, center=(cx, cy), bgr=bgr))
+
+    return palette_colors
 
 
-def frame_to_grid(frame: np.ndarray, threshold: int) -> np.ndarray:
-    sampled, _ = sample_frame_for_grid(frame)
-    gray = cv2.cvtColor(sampled, cv2.COLOR_BGR2GRAY)
-    black = gray < threshold
-    return black
+def bgr_to_luma(bgr: tuple[int, int, int]) -> float:
+    blue, green, red = bgr
+    return 0.114 * blue + 0.587 * green + 0.299 * red
+
+
+def frame_to_grid(sampled_frame: np.ndarray, palette_colors: list[PaletteColor]) -> np.ndarray:
+    palette_lookup = {color.index: color for color in palette_colors}
+    draw_palette = [palette_lookup[index] for index in DRAW_PALETTE_INDICES if index in palette_lookup]
+    if not draw_palette:
+        raise RuntimeError("No drawable palette colors were detected")
+
+    sampled_gray = cv2.cvtColor(sampled_frame, cv2.COLOR_BGR2GRAY).reshape((-1, 1)).astype(np.int32)
+    palette_luma = np.array([[round(bgr_to_luma(color.bgr))] for color in draw_palette], dtype=np.int32)
+    diffs = sampled_gray[:, None, :] - palette_luma[None, :, :]
+    distances = np.sum(diffs * diffs, axis=2, dtype=np.int32)
+    chosen = np.argmin(distances, axis=1)
+    grid = np.array([draw_palette[idx].index for idx in chosen], dtype=np.int32)
+    return grid.reshape((GRID_SIZE, GRID_SIZE))
+
+
+def classify_luma_grid(luma_grid: np.ndarray, palette_colors: list[PaletteColor]) -> np.ndarray:
+    palette_lookup = {color.index: color for color in palette_colors}
+    draw_palette = [palette_lookup[index] for index in DRAW_PALETTE_INDICES if index in palette_lookup]
+    if not draw_palette:
+        raise RuntimeError("No drawable palette colors were detected")
+
+    luma_values = luma_grid.reshape((-1, 1)).astype(np.int32)
+    palette_luma = np.array([[round(bgr_to_luma(color.bgr))] for color in draw_palette], dtype=np.int32)
+    diffs = luma_values[:, None, :] - palette_luma[None, :, :]
+    distances = np.sum(diffs * diffs, axis=2, dtype=np.int32)
+    chosen = np.argmin(distances, axis=1)
+    grid = np.array([draw_palette[idx].index for idx in chosen], dtype=np.int32)
+    return grid.reshape((GRID_SIZE, GRID_SIZE))
+
+
+def render_grid_with_palette_colors(
+    grid: np.ndarray,
+    palette_colors: list[PaletteColor],
+) -> np.ndarray:
+    rendered = np.zeros((GRID_SIZE, GRID_SIZE, 3), dtype=np.uint8)
+    known = np.zeros((GRID_SIZE, GRID_SIZE), dtype=bool)
+
+    for color in palette_colors:
+        mask = grid == color.index
+        if np.any(mask):
+            rendered[mask] = np.array(color.bgr, dtype=np.uint8)
+            known |= mask
+
+    # Mark unexpected color indices clearly in debug output.
+    if np.any(~known):
+        rendered[~known] = np.array((255, 0, 255), dtype=np.uint8)
+
+    return rendered
+
+
+def observed_canvas_to_grid(
+    screenshot_frame: np.ndarray,
+    canvas_rect: tuple[int, int, int, int],
+    palette_colors: list[PaletteColor],
+) -> np.ndarray:
+    x, y, w, h = canvas_rect
+    canvas_crop = screenshot_frame[y : y + h, x : x + w]
+    if canvas_crop.size == 0:
+        raise RuntimeError("Canvas crop is empty while building observed grid")
+
+    canvas_gray = cv2.cvtColor(canvas_crop, cv2.COLOR_BGR2GRAY)
+    observed_luma = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.int32)
+
+    inner_margin_ratio = 0.2
+    percentile = 85.0
+
+    for row in range(GRID_SIZE):
+        y0 = round(row * h / GRID_SIZE)
+        y1 = round((row + 1) * h / GRID_SIZE)
+        for col in range(GRID_SIZE):
+            x0 = round(col * w / GRID_SIZE)
+            x1 = round((col + 1) * w / GRID_SIZE)
+
+            cell = canvas_gray[y0:y1, x0:x1]
+            if cell.size == 0:
+                raise RuntimeError("Observed canvas cell crop is empty")
+
+            inset_x = min((cell.shape[1] - 1) // 2, round(cell.shape[1] * inner_margin_ratio))
+            inset_y = min((cell.shape[0] - 1) // 2, round(cell.shape[0] * inner_margin_ratio))
+            inner = cell[inset_y : cell.shape[0] - inset_y, inset_x : cell.shape[1] - inset_x]
+            if inner.size == 0:
+                inner = cell
+
+            observed_luma[row, col] = round(float(np.percentile(inner, percentile)))
+
+    return classify_luma_grid(observed_luma, palette_colors)
+
+
+def validate_and_correct_frame(
+    session: ScrcpySession,
+    canvas_rect: tuple[int, int, int, int],
+    expected_grid: np.ndarray,
+    palette_colors: list[PaletteColor],
+    action_delay_sec: float,
+    frame_wait_timeout_sec: float,
+    selected_color: int | None,
+    frame_touch_actions: list[TouchAction],
+    debug_dir: Path,
+    frame_index: int,
+    initial_shot: np.ndarray,
+) -> tuple[int | None, np.ndarray, np.ndarray]:
+    shot = initial_shot
+    observed_grid = observed_canvas_to_grid(shot, canvas_rect, palette_colors)
+
+    for attempt in range(1, VALIDATION_MAX_ATTEMPTS + 1):
+        mismatch_mask = observed_grid != expected_grid
+        mismatch_count = int(np.count_nonzero(mismatch_mask))
+        if mismatch_count == 0:
+            if attempt > 1:
+                logger.info("Frame %d validated after %d correction pass(es)", frame_index, attempt - 1)
+            return selected_color, shot, observed_grid
+
+        logger.warning(
+            "Frame %d validation mismatch after draw: attempt=%d mismatched_pixels=%d",
+            frame_index,
+            attempt,
+            mismatch_count,
+        )
+        mismatch_path = save_mismatch_debug_image(
+            debug_dir,
+            frame_index,
+            attempt,
+            shot,
+            canvas_rect,
+            expected_grid,
+            observed_grid,
+            mismatch_mask,
+            palette_colors,
+        )
+        logger.warning("Saved mismatch debug image: %s", mismatch_path)
+
+        selected_color = draw_mask_scanline(
+            session.client.control,
+            canvas_rect,
+            expected_grid,
+            mismatch_mask,
+            palette_colors,
+            action_delay_sec,
+            selected_color,
+            frame_touch_actions,
+        )
+
+        time.sleep(action_delay_sec)
+        shot = session.get_frame(timeout_sec=frame_wait_timeout_sec)
+        observed_grid = observed_canvas_to_grid(shot, canvas_rect, palette_colors)
+
+    mismatch_count = int(np.count_nonzero(observed_grid != expected_grid))
+    failure_path = save_debug_screenshot(debug_dir, shot, f"validation_failed_frame_{frame_index:06d}")
+    raise RuntimeError(
+        "Frame validation failed after "
+        f"{VALIDATION_MAX_ATTEMPTS} correction passes for frame {frame_index}; "
+        f"remaining_mismatched_pixels={mismatch_count}; screenshot={failure_path}"
+    )
 
 
 def sample_frame_for_grid(frame: np.ndarray) -> tuple[np.ndarray, tuple[int, int, int, int]]:
@@ -469,25 +825,16 @@ def tap(control: scrcpy.control.ControlSender, x: int, y: int) -> None:
 
 def select_color(
     control: scrcpy.control.ControlSender,
-    color_name: str,
-    selected_color: str | None,
-    black_cell: tuple[int, int],
-    white_cell: tuple[int, int],
+    color: PaletteColor,
+    selected_color: int | None,
     action_delay_sec: float,
-) -> str:
-    if selected_color == color_name:
+) -> int:
+    if selected_color == color.index:
         return selected_color
 
-    if color_name == "black":
-        x, y = black_cell
-    elif color_name == "white":
-        x, y = white_cell
-    else:
-        raise ValueError(f"Unsupported color: {color_name}")
-
-    tap(control, x, y)
+    tap(control, color.center[0], color.center[1])
     time.sleep(action_delay_sec)
-    return color_name
+    return color.index
 
 
 def draw_mask_scanline(
@@ -495,11 +842,11 @@ def draw_mask_scanline(
     canvas_rect: tuple[int, int, int, int],
     target_grid: np.ndarray,
     draw_mask: np.ndarray,
-    black_cell: tuple[int, int],
-    white_cell: tuple[int, int],
+    palette_colors: list[PaletteColor],
     action_delay_sec: float,
-    selected_color: str | None,
-) -> str | None:
+    selected_color: int | None,
+    touch_actions: list[TouchAction],
+) -> int | None:
     def _draw_scanline_runs(color_mask: np.ndarray) -> None:
         for row in range(GRID_SIZE):
             col = 0
@@ -518,51 +865,44 @@ def draw_mask_scanline(
 
                 start_x, start_y = cell_center(canvas_rect, row, run_start)
                 end_x, end_y = cell_center(canvas_rect, row, run_end)
+                run_length = run_end - run_start + 1
 
-                if run_start == run_end:
-                    tap(control, start_x, start_y)
+                if run_length < 4:
+                    for tap_col in range(run_start, run_end + 1):
+                        tap_x, tap_y = cell_center(canvas_rect, row, tap_col)
+                        tap(control, tap_x, tap_y)
+                        touch_actions.append(TouchAction(kind="tap", start=(tap_x, tap_y), end=(tap_x, tap_y)))
+                        time.sleep(action_delay_sec)
                 else:
                     control.swipe(start_x, start_y, end_x, end_y)
+                    touch_actions.append(
+                        TouchAction(kind="swipe", start=(start_x, start_y), end=(end_x, end_y))
+                    )
 
                 time.sleep(action_delay_sec)
 
-    black_mask = np.logical_and(draw_mask, target_grid)
-    white_mask = np.logical_and(draw_mask, np.logical_not(target_grid))
+    active_colors = [color for color in palette_colors if color.index in DRAW_PALETTE_INDICES]
+    color_masks: dict[int, np.ndarray] = {}
+    present_colors: list[PaletteColor] = []
+    for color in active_colors:
+        color_mask = np.logical_and(draw_mask, target_grid == color.index)
+        if np.any(color_mask):
+            color_masks[color.index] = color_mask
+            present_colors.append(color)
 
-    has_black = bool(np.any(black_mask))
-    has_white = bool(np.any(white_mask))
-    if not has_black and not has_white:
+    if not present_colors:
         return selected_color
 
-    # Draw by color in at most two passes and keep current color when possible.
-    phase_order: list[str] = []
-    if selected_color == "black" and has_black:
-        phase_order.append("black")
-        if has_white:
-            phase_order.append("white")
-    elif selected_color == "white" and has_white:
-        phase_order.append("white")
-        if has_black:
-            phase_order.append("black")
-    else:
-        if has_black:
-            phase_order.append("black")
-        if has_white:
-            phase_order.append("white")
+    phase_order = sorted(present_colors, key=lambda color: bgr_to_luma(color.bgr), reverse=True)
 
-    for color_name in phase_order:
+    for color in phase_order:
         selected_color = select_color(
             control,
-            color_name,
+            color,
             selected_color,
-            black_cell,
-            white_cell,
             action_delay_sec,
         )
-        if color_name == "black":
-            _draw_scanline_runs(black_mask)
-        else:
-            _draw_scanline_runs(white_mask)
+        _draw_scanline_runs(color_masks[color.index])
 
     return selected_color
 
@@ -609,7 +949,7 @@ def clear_canvas(
 
 
 def extract_sampled_frames_and_grids(
-    video_path: Path, target_fps: float, threshold: int
+    video_path: Path, target_fps: float, palette_colors: list[PaletteColor]
 ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
     logger.info("Sampling source video at %.2f fps", target_fps)
     capture = cv2.VideoCapture(str(video_path))
@@ -633,8 +973,7 @@ def extract_sampled_frames_and_grids(
         frame_time = frame_idx / source_fps
         if frame_time + 1e-6 >= next_sample_time:
             sampled_frame, _ = sample_frame_for_grid(frame)
-            gray = cv2.cvtColor(sampled_frame, cv2.COLOR_BGR2GRAY)
-            grid = gray < threshold
+            grid = frame_to_grid(sampled_frame, palette_colors)
             sampled.append((frame.copy(), sampled_frame, grid))
             next_sample_time += target_step
 
@@ -662,8 +1001,10 @@ def save_frame_comparison_debug_image(
     frame_index: int,
     source_frame: np.ndarray,
     sampled_frame: np.ndarray,
+    drawn_palette_frame: np.ndarray,
     screenshot_frame: np.ndarray,
     canvas_rect: tuple[int, int, int, int],
+    touch_actions: list[TouchAction],
 ) -> None:
     x, y, w, h = canvas_rect
 
@@ -675,7 +1016,28 @@ def save_frame_comparison_debug_image(
         raise RuntimeError("Canvas crop is out of screenshot bounds")
 
     canvas_crop = screenshot_frame[sy0:sy1, sx0:sx1]
-    target_h = canvas_crop.shape[0]
+    canvas_overlay = canvas_crop.copy()
+    target_h = canvas_overlay.shape[0]
+
+    # Overlay expected cell boundaries in the canvas pane.
+    for col in range(1, GRID_SIZE):
+        gx = round(col * canvas_overlay.shape[1] / GRID_SIZE)
+        cv2.line(canvas_overlay, (gx, 0), (gx, canvas_overlay.shape[0] - 1), (160, 160, 160), 1, cv2.LINE_AA)
+
+    for row in range(1, GRID_SIZE):
+        gy = round(row * canvas_overlay.shape[0] / GRID_SIZE)
+        cv2.line(canvas_overlay, (0, gy), (canvas_overlay.shape[1] - 1, gy), (160, 160, 160), 1, cv2.LINE_AA)
+
+    # Overlay touch actions onto the canvas pane.
+    for action in touch_actions:
+        start_local = (action.start[0] - x, action.start[1] - y)
+        end_local = (action.end[0] - x, action.end[1] - y)
+        if action.kind == "tap":
+            cv2.circle(canvas_overlay, start_local, 3, (0, 255, 255), -1, cv2.LINE_AA)
+        else:
+            cv2.line(canvas_overlay, start_local, end_local, (0, 255, 255), 2, cv2.LINE_AA)
+            cv2.circle(canvas_overlay, start_local, 2, (0, 255, 255), -1, cv2.LINE_AA)
+            cv2.circle(canvas_overlay, end_local, 2, (0, 255, 255), -1, cv2.LINE_AA)
 
     source_with_rect = source_frame.copy()
     rx0, ry0, rx1, ry1 = sample_frame_for_grid(source_frame)[1]
@@ -689,10 +1051,11 @@ def save_frame_comparison_debug_image(
 
     left = _resize_to_height(source_with_rect, target_h)
     middle = _resize_to_height(sampled_frame, target_h)
-    right = _resize_to_height(canvas_crop, target_h)
+    third = _resize_to_height(drawn_palette_frame, target_h)
+    right = _resize_to_height(canvas_overlay, target_h)
 
     separator = np.full((target_h, 3, 3), (255, 0, 0), dtype=np.uint8)
-    combined = np.hstack((left, separator, middle, separator, right))
+    combined = np.hstack((left, separator, middle, separator, third, separator, right))
 
     frame_debug_dir = debug_dir / "frames"
     frame_debug_dir.mkdir(parents=True, exist_ok=True)
@@ -700,6 +1063,64 @@ def save_frame_comparison_debug_image(
     ok = cv2.imwrite(str(path), combined)
     if not ok:
         raise RuntimeError(f"Failed to write frame debug image: {path}")
+
+
+def save_mismatch_debug_image(
+    debug_dir: Path,
+    frame_index: int,
+    attempt: int,
+    screenshot_frame: np.ndarray,
+    canvas_rect: tuple[int, int, int, int],
+    expected_grid: np.ndarray,
+    observed_grid: np.ndarray,
+    mismatch_mask: np.ndarray,
+    palette_colors: list[PaletteColor],
+) -> Path:
+    x, y, w, h = canvas_rect
+    sx0 = max(0, x)
+    sy0 = max(0, y)
+    sx1 = min(screenshot_frame.shape[1], x + w)
+    sy1 = min(screenshot_frame.shape[0], y + h)
+    if sx1 <= sx0 or sy1 <= sy0:
+        raise RuntimeError("Canvas crop is out of screenshot bounds")
+
+    canvas_crop = screenshot_frame[sy0:sy1, sx0:sx1]
+    canvas_overlay = canvas_crop.copy()
+    expected_frame = render_grid_with_palette_colors(expected_grid, palette_colors)
+    observed_frame = render_grid_with_palette_colors(observed_grid, palette_colors)
+    target_h = canvas_overlay.shape[0]
+
+    for row in range(GRID_SIZE):
+        y0 = round(row * canvas_overlay.shape[0] / GRID_SIZE)
+        y1 = round((row + 1) * canvas_overlay.shape[0] / GRID_SIZE)
+        for col in range(GRID_SIZE):
+            x0 = round(col * canvas_overlay.shape[1] / GRID_SIZE)
+            x1 = round((col + 1) * canvas_overlay.shape[1] / GRID_SIZE)
+            if mismatch_mask[row, col]:
+                cv2.rectangle(canvas_overlay, (x0, y0), (x1 - 1, y1 - 1), (0, 0, 255), 2)
+            else:
+                cv2.rectangle(canvas_overlay, (x0, y0), (x1 - 1, y1 - 1), (96, 96, 96), 1)
+
+    def _resize_to_height(image: np.ndarray, height: int) -> np.ndarray:
+        if image.shape[0] == height:
+            return image
+        new_w = max(1, round(image.shape[1] * (height / image.shape[0])))
+        return cv2.resize(image, (new_w, height), interpolation=cv2.INTER_NEAREST)
+
+    expected_panel = _resize_to_height(expected_frame, target_h)
+    observed_panel = _resize_to_height(observed_frame, target_h)
+    canvas_panel = _resize_to_height(canvas_overlay, target_h)
+
+    separator = np.full((target_h, 3, 3), (255, 0, 0), dtype=np.uint8)
+    combined = np.hstack((expected_panel, separator, observed_panel, separator, canvas_panel))
+
+    frame_debug_dir = debug_dir / "frames"
+    frame_debug_dir.mkdir(parents=True, exist_ok=True)
+    path = frame_debug_dir / f"frame_{frame_index:06d}_attempt_{attempt:02d}_mismatch.png"
+    ok = cv2.imwrite(str(path), combined)
+    if not ok:
+        raise RuntimeError(f"Failed to write mismatch debug image: {path}")
+    return path
 
 
 def source_has_audio(ffprobe_path: str, source_video: Path) -> bool:
@@ -807,29 +1228,6 @@ def main() -> None:
     ensure_adb_connection(config)
 
     source_video = get_first_video_file(config.assets_dir)
-    sampled_frames = extract_sampled_frames_and_grids(
-        source_video,
-        config.draw_fps,
-        config.frame_threshold,
-    )
-
-    total_frame_count = len(sampled_frames)
-    start_idx = 0 if config.frame_start is None else max(0, config.frame_start)
-    if config.frame_end is not None:
-        end_idx = min(total_frame_count, config.frame_end + 1)
-        if end_idx < start_idx:
-            raise ValueError("frame_end must be greater than or equal to frame_start")
-    else:
-        end_idx = total_frame_count
-
-    sampled_frames = sampled_frames[start_idx:end_idx]
-    if start_idx != 0 or end_idx != total_frame_count:
-        logger.info(
-            "Frame range configured: processing frames %d to %d (%d frames)",
-            start_idx,
-            end_idx - 1,
-            len(sampled_frames),
-        )
     palette_template, clear_template, clear_confirm_template = load_templates(config)
 
     clear_screenshots_dir(config.screenshots_dir)
@@ -870,11 +1268,52 @@ def main() -> None:
         except RuntimeError:
             save_debug_screenshot(config.debug_dir, screen, "detect_clear_button_failed")
             raise
+        clear_button_rect = (cx, cy, cw, ch)
         clear_button_center = (cx + cw // 2, cy + ch // 2)
         logger.info("Clear button detected with score %.3f", score)
 
-        black_cell, white_cell = compute_palette_cells(palette_rect)
-        logger.info("Palette cells resolved: black=%s white=%s", black_cell, white_cell)
+        palette_colors = compute_palette_colors(screen, palette_rect, palette_template)
+        logger.info(
+            "Palette colors resolved: %s",
+            ", ".join(
+                f"{color.name}#{color.index}@{color.center}={color.bgr}" for color in palette_colors
+            ),
+        )
+        draw_color_indices = [color.index for color in palette_colors if color.index in DRAW_PALETTE_INDICES]
+        if BACKGROUND_PALETTE_INDEX not in draw_color_indices:
+            raise RuntimeError("Background palette color was not detected")
+
+        save_base_debug_image(
+            config.debug_dir,
+            screen,
+            canvas_rect,
+            palette_rect,
+            clear_button_rect,
+        )
+
+        sampled_frames = extract_sampled_frames_and_grids(
+            source_video,
+            config.draw_fps,
+            palette_colors,
+        )
+
+        total_frame_count = len(sampled_frames)
+        start_idx = 0 if config.frame_start is None else max(0, config.frame_start)
+        if config.frame_end is not None:
+            end_idx = min(total_frame_count, config.frame_end + 1)
+            if end_idx < start_idx:
+                raise ValueError("frame_end must be greater than or equal to frame_start")
+        else:
+            end_idx = total_frame_count
+
+        sampled_frames = sampled_frames[start_idx:end_idx]
+        if start_idx != 0 or end_idx != total_frame_count:
+            logger.info(
+                "Frame range configured: processing frames %d to %d (%d frames)",
+                start_idx,
+                end_idx - 1,
+                len(sampled_frames),
+            )
 
         clear_canvas(
             session,
@@ -886,36 +1325,36 @@ def main() -> None:
             config.debug_dir,
         )
 
-        selected_color: str | None = None
+        selected_color: int | None = None
         prev_grid: np.ndarray | None = None
 
         total_frames = len(sampled_frames)
         logger.info("Starting draw loop for %d frames", total_frames)
         for i, (source_frame, sampled_frame, grid) in enumerate(sampled_frames, start=1):
             if prev_grid is None:
-                draw_mask = grid.copy()
+                draw_mask = grid != BACKGROUND_PALETTE_INDEX
                 logger.info("Frame %d/%d: initial full draw", i, total_frames)
             else:
                 changed_mask = grid != prev_grid
                 changed_count = int(np.count_nonzero(changed_mask))
-                current_black_count = int(np.count_nonzero(grid))
+                current_draw_count = int(np.count_nonzero(np.isin(grid, draw_color_indices)))
 
-                if changed_count < current_black_count:
+                if changed_count < current_draw_count:
                     draw_mask = changed_mask
                     logger.debug(
-                        "Frame %d/%d: incremental draw changed=%d black=%d",
+                        "Frame %d/%d: incremental draw changed=%d drawn=%d",
                         i,
                         total_frames,
                         changed_count,
-                        current_black_count,
+                        current_draw_count,
                     )
                 else:
                     logger.info(
-                        "Frame %d/%d: clear and redraw changed=%d black=%d",
+                        "Frame %d/%d: clear and redraw changed=%d drawn=%d",
                         i,
                         total_frames,
                         changed_count,
-                        current_black_count,
+                        current_draw_count,
                     )
                     clear_canvas(
                         session,
@@ -927,32 +1366,47 @@ def main() -> None:
                         config.debug_dir,
                     )
                     selected_color = None
-                    draw_mask = grid.copy()
+                    draw_mask = np.isin(grid, draw_color_indices)
 
+            frame_touch_actions: list[TouchAction] = []
             selected_color = draw_mask_scanline(
                 session.client.control,
                 canvas_rect,
                 grid,
                 draw_mask,
-                black_cell,
-                white_cell,
+                palette_colors,
                 config.action_delay_sec,
                 selected_color,
+                frame_touch_actions,
             )
-
-            prev_grid = grid.copy()
 
             time.sleep(config.action_delay_sec)
             shot = session.get_frame(timeout_sec=config.frame_wait_timeout_sec)
+            selected_color, shot, prev_grid = validate_and_correct_frame(
+                session,
+                canvas_rect,
+                grid,
+                palette_colors,
+                config.action_delay_sec,
+                config.frame_wait_timeout_sec,
+                selected_color,
+                frame_touch_actions,
+                config.debug_dir,
+                i,
+                shot,
+            )
             screenshot_path = config.screenshots_dir / f"frame_{i:06d}.png"
             write_frame_image(screenshot_path, shot)
+            drawn_palette_frame = render_grid_with_palette_colors(grid, palette_colors)
             save_frame_comparison_debug_image(
                 config.debug_dir,
                 i,
                 source_frame,
                 sampled_frame,
+                drawn_palette_frame,
                 shot,
                 canvas_rect,
+                frame_touch_actions,
             )
 
             if i == 1 or i == total_frames or i % 10 == 0:
