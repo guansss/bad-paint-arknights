@@ -59,7 +59,7 @@ class Config:
     minitouch_binaries_dir: Path | None = None
     minitouch_host_port: int = 1111
     minitouch_tap_hold_sec: float = 0.02
-    minitouch_swipe_step_px: int = 24
+    minitouch_swipe_step_px: int = 12
     minitouch_swipe_step_delay_sec: float = 0.01
 
     draw_fps: float = 5.0
@@ -67,6 +67,7 @@ class Config:
     frame_end: int | None = None
     frame_threshold: int = 127
     action_delay_sec: float = 0.08
+    source_scale_mode: str = "normal"
 
     template_score_threshold: float = 0.55
     clear_confirm_timeout_sec: float = 3.0
@@ -139,6 +140,8 @@ def load_config_from_json(project_root: Path) -> Config:
         config.frame_threshold = int(data["frame_threshold"])
     if "action_delay_sec" in data:
         config.action_delay_sec = float(data["action_delay_sec"])
+    if "source_scale_mode" in data:
+        config.source_scale_mode = str(data["source_scale_mode"])
     if "template_score_threshold" in data:
         config.template_score_threshold = float(data["template_score_threshold"])
     if "clear_confirm_timeout_sec" in data:
@@ -158,6 +161,8 @@ def load_config_from_json(project_root: Path) -> Config:
         raise ValueError("minitouch_swipe_step_px must be positive")
     if config.minitouch_swipe_step_delay_sec < 0:
         raise ValueError("minitouch_swipe_step_delay_sec must be non-negative")
+    if config.source_scale_mode not in ("cover", "normal"):
+        raise ValueError("source_scale_mode must be either 'cover' or 'normal'")
 
     logger.info("Loaded configuration from %s", config_path)
     return config
@@ -1055,9 +1060,19 @@ def validate_and_correct_frame(
     )
 
 
-def sample_frame_for_grid(frame: np.ndarray) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+def sample_frame_for_grid(
+    frame: np.ndarray,
+    scale_mode: str,
+) -> tuple[np.ndarray, tuple[int, int, int, int]]:
     target = GRID_SIZE
     h, w = frame.shape[:2]
+
+    if scale_mode == "normal":
+        resized = cv2.resize(frame, (target, target), interpolation=cv2.INTER_AREA)
+        return resized, (0, 0, w, h)
+
+    if scale_mode != "cover":
+        raise ValueError(f"Unsupported scale mode: {scale_mode!r}")
 
     scale = max(target / w, target / h)
     resized_w = round(w * scale)
@@ -1237,9 +1252,16 @@ def clear_canvas(
 
 
 def extract_sampled_frames_and_grids(
-    video_path: Path, target_fps: float, palette_colors: list[PaletteColor]
+    video_path: Path,
+    target_fps: float,
+    palette_colors: list[PaletteColor],
+    source_scale_mode: str,
 ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
-    logger.info("Sampling source video at %.2f fps", target_fps)
+    logger.info(
+        "Sampling source video at %.2f fps using scale_mode=%s",
+        target_fps,
+        source_scale_mode,
+    )
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
         raise RuntimeError(f"Failed to open video: {video_path}")
@@ -1260,7 +1282,7 @@ def extract_sampled_frames_and_grids(
 
         frame_time = frame_idx / source_fps
         if frame_time + 1e-6 >= next_sample_time:
-            sampled_frame, _ = sample_frame_for_grid(frame)
+            sampled_frame, _ = sample_frame_for_grid(frame, source_scale_mode)
             grid = frame_to_grid(sampled_frame, palette_colors)
             sampled.append((frame.copy(), sampled_frame, grid))
             next_sample_time += target_step
@@ -1293,6 +1315,7 @@ def save_frame_comparison_debug_image(
     screenshot_frame: np.ndarray,
     canvas_rect: tuple[int, int, int, int],
     touch_actions: list[TouchAction],
+    source_scale_mode: str,
 ) -> None:
     x, y, w, h = canvas_rect
 
@@ -1328,7 +1351,7 @@ def save_frame_comparison_debug_image(
             cv2.circle(canvas_overlay, end_local, 2, (0, 255, 255), -1, cv2.LINE_AA)
 
     source_with_rect = source_frame.copy()
-    rx0, ry0, rx1, ry1 = sample_frame_for_grid(source_frame)[1]
+    rx0, ry0, rx1, ry1 = sample_frame_for_grid(source_frame, source_scale_mode)[1]
     cv2.rectangle(source_with_rect, (rx0, ry0), (rx1 - 1, ry1 - 1), (0, 255, 0), 2)
 
     def _resize_to_height(image: np.ndarray, height: int) -> np.ndarray:
@@ -1597,6 +1620,7 @@ def main() -> None:
             source_video,
             config.draw_fps,
             palette_colors,
+            config.source_scale_mode,
         )
 
         total_frame_count = len(sampled_frames)
@@ -1716,6 +1740,7 @@ def main() -> None:
                 shot,
                 canvas_rect,
                 frame_touch_actions,
+                config.source_scale_mode,
             )
 
             if i == 1 or i == total_frames or i % 10 == 0:

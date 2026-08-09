@@ -20,6 +20,7 @@
   "frame_end": null,
   "frame_threshold": 127,
   "action_delay_sec": 0.08,
+  "source_scale_mode": "normal",
 
   "template_score_threshold": 0.55,
   "clear_confirm_timeout_sec": 3.0,
