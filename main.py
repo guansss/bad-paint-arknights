@@ -608,11 +608,16 @@ def match_template_multiscale(
 ) -> tuple[int, int, int, int, float]:
     img_h, img_w = image.shape[:2]
     base_scale = min(img_w / BASE_TEMPLATE_WIDTH, img_h / BASE_TEMPLATE_HEIGHT)
-    scales = np.linspace(base_scale * 0.6, base_scale * 1.4, 17)
+    relative_scales = np.linspace(0.6, 1.4, 17)
+    ordered_relative_scales = sorted(
+        relative_scales,
+        key=lambda scale: (abs(scale - 1.0), 0 if scale < 1.0 else 1),
+    )
 
     best = (-1, -1, 0, 0, -1.0)
 
-    for scale in scales:
+    for relative_scale in ordered_relative_scales:
+        scale = base_scale * relative_scale
         if scale <= 0:
             continue
 
