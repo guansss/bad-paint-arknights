@@ -1657,12 +1657,15 @@ def main() -> None:
         total_frame_process_time_sec = 0.0
 
         total_frames = len(sampled_frames)
+        start_frame_number = 0 if config.frame_start is None else max(0, config.frame_start)
+        end_frame_number = start_frame_number + total_frames - 1 if total_frames > 0 else start_frame_number
         logger.info("Starting draw loop for %d frames", total_frames)
-        for i, (source_frame, sampled_frame, grid) in enumerate(sampled_frames, start=1):
+        for processed_idx, (source_frame, sampled_frame, grid) in enumerate(sampled_frames, start=1):
+            frame_idx = start_frame_number + processed_idx - 1
             frame_process_start = time.perf_counter()
             if prev_grid is None:
                 draw_mask = grid != BACKGROUND_PALETTE_INDEX
-                logger.info("Frame %d/%d: initial full draw", i, total_frames)
+                logger.info("Frame %d/%d: initial full draw", frame_idx, end_frame_number)
             else:
                 changed_mask = grid != prev_grid
                 changed_count = int(np.count_nonzero(changed_mask))
@@ -1672,16 +1675,16 @@ def main() -> None:
                     draw_mask = changed_mask
                     logger.debug(
                         "Frame %d/%d: incremental draw changed=%d drawn=%d",
-                        i,
-                        total_frames,
+                        frame_idx,
+                        end_frame_number,
                         changed_count,
                         current_draw_count,
                     )
                 else:
                     logger.info(
                         "Frame %d/%d: clear and redraw changed=%d drawn=%d",
-                        i,
-                        total_frames,
+                        frame_idx,
+                        end_frame_number,
                         changed_count,
                         current_draw_count,
                     )
@@ -1726,16 +1729,16 @@ def main() -> None:
                 selected_color,
                 frame_touch_actions,
                 config.debug_dir,
-                i,
+                frame_idx,
                 shot,
                 latest_frame_seq,
             )
-            screenshot_path = config.screenshots_dir / f"frame_{i:06d}.png"
+            screenshot_path = config.screenshots_dir / f"frame_{frame_idx:06d}.png"
             write_frame_image(screenshot_path, shot)
             drawn_palette_frame = render_grid_with_palette_colors(grid, palette_colors)
             save_frame_comparison_debug_image(
                 config.debug_dir,
-                i,
+                frame_idx,
                 source_frame,
                 sampled_frame,
                 drawn_palette_frame,
@@ -1748,12 +1751,12 @@ def main() -> None:
             frame_process_time_sec = time.perf_counter() - frame_process_start
             total_frame_process_time_sec += frame_process_time_sec
 
-            if i == 1 or i == total_frames or i % 10 == 0:
-                average_frame_process_time_sec = total_frame_process_time_sec / i
+            if processed_idx == 1 or processed_idx == total_frames or processed_idx % 10 == 0:
+                average_frame_process_time_sec = total_frame_process_time_sec / processed_idx
                 logger.info(
                     "Saved screenshot for frame %d/%d in %.3fs (avg %.3fs)",
-                    i,
-                    total_frames,
+                    frame_idx,
+                    end_frame_number,
                     frame_process_time_sec,
                     average_frame_process_time_sec,
                 )
