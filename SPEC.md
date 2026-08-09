@@ -4,15 +4,16 @@ Build a script that simulates a series of touch events on an Android emulator to
 
 ## Tech Stack
 
-- **Python**: OpenCV, [scrcpy-client](https://github.com/leng-yue/py-scrcpy-client)
-- **External Tools**: ffmpeg, ADB
+- **Python**: OpenCV and the Python standard library
+- **External Tools**: ffmpeg and ADB
+- **Device Touch Service**: [minitouch](https://github.com/openstf/minitouch), with ABI-specific binaries kept in the repository
 
 ## Steps
 
 1. Connect to the Android emulator using ADB.
 2. Capture the video frame by frame.
 3. For each frame, process the image to determine the touch events needed to replicate the drawing.
-4. Use scrcpy to send the touch events to the emulator.
+4. Use minitouch to send the touch events to the emulator.
 5. Capture and save a screenshot of the emulator after each frame is drawn.
 6. Compile the screenshots into a video to visualize the drawing process.
 
@@ -34,6 +35,9 @@ There is a "clear" button that, with a confirmation dialog, clears the entire ca
 project/
 ├── SPEC.md
 ├── assets/
+│   ├── minitouch/
+│   │   └── <abi>/
+│   │       └── minitouch
 │   ├── templates/
 │   │   ├── palette-first-row.png
 │   │   ├── clear-button.png
@@ -50,21 +54,38 @@ project/
 
 #### Environment
 
-Use Python venv to manage dependencies.
+Use a Python virtual environment to manage dependencies.
 
-The path of required external libraries (ffmpeg, ADB) can be specified through variables, and if not specified, the script will assume that they are available in the system's PATH.
+The paths of ADB and ffmpeg can be configured. When omitted, the script assumes they are available on the system PATH.
+
+Minitouch binaries must be present under `assets/minitouch/<abi>/minitouch`, where `<abi>` exactly matches the device's `ro.product.cpu.abi` value. For example, an `x86_64` emulator requires `assets/minitouch/x86_64/minitouch`.
 
 #### Communication with the emulator
 
-Use `scrcpy-client` to control scrcpy and connect to the Android emulator for sending touch events and reading screen through video stream.
+ADB is used to connect to the emulator and capture screenshots. Every screen read runs `adb exec-out screencap -p`; OpenCV decodes the returned PNG into a BGR frame. Each successful capture receives a monotonically increasing sequence number, so validation reads always use a newly captured screenshot rather than a buffered video frame.
 
-The address of the emulator can be specified through a variable, and if not specified, let scrcpy automatically detect the emulator.
+The emulator serial can be configured. If omitted and multiple devices are online, the script selects the first device reported by `adb devices` and logs the selection.
+
+At startup, the script reads the emulator ABI, pushes the matching minitouch binary to `/data/local/tmp/minitouch`, makes it executable, starts it through ADB, and forwards its abstract local socket to the configured host port. The minitouch capability handshake supplies the device touch-coordinate range; screen coordinates from screenshots are normalized to that range before each touch command.
 
 A short configurable per-action delay should be added after each action to ensure that the emulator and the app have enough time to render before the next action.
 
+The transport is fail-fast. ADB screenshot, PNG decode, minitouch provisioning, socket-forwarding, handshake, or gesture-command failures stop the run with an actionable error. There is no fallback touch or capture backend. Shutdown closes the minitouch socket, removes the ADB forward, and stops the minitouch process.
+
+#### Configuration
+
+The active touch and capture configuration includes:
+
+- `adb_path` and `emulator_serial` for selecting the Android device.
+- `minitouch_binaries_dir` for the root containing ABI-specific minitouch binaries.
+- `minitouch_host_port` for the local ADB-forwarded minitouch port.
+- `minitouch_tap_hold_sec` and `minitouch_swipe_step_delay_sec` for reliable gesture timing.
+- `minitouch_swipe_step_px` for the screenshot-pixel distance between interpolated swipe moves; the default is `24`.
+- `frame_wait_timeout_sec` as the maximum duration of an individual ADB screencap command.
+
 #### Detecting interaction areas
 
-Before drawing, detect the interaction areas through the video stream.
+Before drawing, detect the interaction areas from an ADB screenshot.
 
 To detect the canvas, find the largest white square in the screen. To speed up the process, assume the canvas's side length to be at least 50% of the screen height. The canvas is "almost" uniformly white, but not perfectly white as it contains a subtle light gray background pattern.
 
@@ -94,7 +115,7 @@ To optimize the drawing process, before drawing each frame, compare the current 
 
 To pick a color, simulate a tap event on the corresponding color grid in the palette. Since the canvas's background is already white, only the non-white pixels need to be drawn, unless the previous frame had non-white pixels that need to be overwritten with white.
 
-After drawing each frame, capture a frame of the video stream and save it as a screenshot in the `screenshots/` directory.
+After drawing each frame, capture a fresh ADB screenshot and save it in the `screenshots/` directory.
 
 #### Video Processing
 

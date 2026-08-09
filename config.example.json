@@ -9,6 +9,11 @@
   "ffmpeg_path": "ffmpeg",
   "ffprobe_path": "ffprobe",
   "emulator_serial": null,
+  "minitouch_binaries_dir": "assets/minitouch",
+  "minitouch_host_port": 1111,
+  "minitouch_tap_hold_sec": 0.02,
+  "minitouch_swipe_step_px": 12,
+  "minitouch_swipe_step_delay_sec": 0.01,
 
   "draw_fps": 5,
   "frame_start": 0,

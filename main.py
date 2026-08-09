@@ -1,19 +1,15 @@
 import json
 import logging
 import shutil
+import socket
 import subprocess
-import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from av.codec import CodecContext
-from av.error import InvalidDataError
-
 import cv2
 import numpy as np
-import scrcpy
 
 GRID_SIZE = 24
 BASE_TEMPLATE_WIDTH = 1920
@@ -47,42 +43,6 @@ class TouchAction:
     end: tuple[int, int]
 
 
-class SafeScrcpyClient(scrcpy.Client):
-    def _Client__stream_loop(self) -> None:
-        codec = CodecContext.create("h264", "r")
-        while self.alive:
-            try:
-                raw_h264 = self._Client__video_socket.recv(0x10000)
-                if not raw_h264:
-                    if self.alive:
-                        time.sleep(0.01)
-                    continue
-
-                packets = codec.parse(raw_h264)
-                for packet in packets:
-                    try:
-                        frames = codec.decode(packet)
-                    except InvalidDataError:
-                        if self.alive:
-                            logger.debug("Discarded malformed scrcpy video packet")
-                        continue
-
-                    for frame in frames:
-                        frame = frame.to_ndarray(format="bgr24")
-                        if self.flip:
-                            frame = cv2.flip(frame, 1)
-                        self.last_frame = frame
-                        self.resolution = (frame.shape[1], frame.shape[0])
-                        self._Client__send_to_listeners(scrcpy.EVENT_FRAME, frame)
-            except BlockingIOError:
-                time.sleep(0.01)
-                if not self.block_frame:
-                    self._Client__send_to_listeners(scrcpy.EVENT_FRAME, None)
-            except OSError:
-                if self.alive:
-                    raise
-
-
 @dataclass
 class Config:
     project_root: Path
@@ -96,6 +56,11 @@ class Config:
     ffmpeg_path: str = "ffmpeg"
     ffprobe_path: str = "ffprobe"
     emulator_serial: str | None = None
+    minitouch_binaries_dir: Path | None = None
+    minitouch_host_port: int = 1111
+    minitouch_tap_hold_sec: float = 0.02
+    minitouch_swipe_step_px: int = 24
+    minitouch_swipe_step_delay_sec: float = 0.01
 
     draw_fps: float = 5.0
     frame_start: int | None = None
@@ -117,6 +82,7 @@ def load_config_from_json(project_root: Path) -> Config:
         screenshots_dir=project_root / "screenshots",
         debug_dir=project_root / "debug",
         output_video_path=project_root / "output.mp4",
+        minitouch_binaries_dir=project_root / "assets" / "minitouch",
     )
 
     config_path = project_root / "config.json"
@@ -152,6 +118,16 @@ def load_config_from_json(project_root: Path) -> Config:
         config.ffprobe_path = str(data["ffprobe_path"])
     if "emulator_serial" in data:
         config.emulator_serial = data["emulator_serial"]
+    if "minitouch_binaries_dir" in data:
+        config.minitouch_binaries_dir = _path_from_value(data["minitouch_binaries_dir"])
+    if "minitouch_host_port" in data:
+        config.minitouch_host_port = int(data["minitouch_host_port"])
+    if "minitouch_tap_hold_sec" in data:
+        config.minitouch_tap_hold_sec = float(data["minitouch_tap_hold_sec"])
+    if "minitouch_swipe_step_px" in data:
+        config.minitouch_swipe_step_px = int(data["minitouch_swipe_step_px"])
+    if "minitouch_swipe_step_delay_sec" in data:
+        config.minitouch_swipe_step_delay_sec = float(data["minitouch_swipe_step_delay_sec"])
 
     if "draw_fps" in data:
         config.draw_fps = float(data["draw_fps"])
@@ -171,6 +147,17 @@ def load_config_from_json(project_root: Path) -> Config:
         config.frame_wait_timeout_sec = float(data["frame_wait_timeout_sec"])
     if "log_level" in data:
         config.log_level = str(data["log_level"])
+
+    if config.minitouch_binaries_dir is None:
+        raise ValueError("minitouch_binaries_dir must be configured")
+    if not 1 <= config.minitouch_host_port <= 65535:
+        raise ValueError("minitouch_host_port must be between 1 and 65535")
+    if config.minitouch_tap_hold_sec < 0:
+        raise ValueError("minitouch_tap_hold_sec must be non-negative")
+    if config.minitouch_swipe_step_px <= 0:
+        raise ValueError("minitouch_swipe_step_px must be positive")
+    if config.minitouch_swipe_step_delay_sec < 0:
+        raise ValueError("minitouch_swipe_step_delay_sec must be non-negative")
 
     logger.info("Loaded configuration from %s", config_path)
     return config
@@ -244,36 +231,6 @@ def save_base_debug_image(
     return path
 
 
-class ScrcpySession:
-    def __init__(self, serial: str | None, max_fps: int):
-        self._frame_lock = threading.Lock()
-        self._latest_frame: np.ndarray | None = None
-
-        self.client = SafeScrcpyClient(device=serial, max_fps=max_fps, block_frame=False)
-        self.client.add_listener(scrcpy.EVENT_FRAME, self._on_frame)
-
-    def _on_frame(self, frame: np.ndarray | None) -> None:
-        if frame is None:
-            return
-        with self._frame_lock:
-            self._latest_frame = frame.copy()
-
-    def start(self) -> None:
-        self.client.start(threaded=True)
-
-    def stop(self) -> None:
-        self.client.stop()
-
-    def get_frame(self, timeout_sec: float) -> np.ndarray:
-        deadline = time.time() + timeout_sec
-        while time.time() < deadline:
-            with self._frame_lock:
-                if self._latest_frame is not None:
-                    return self._latest_frame.copy()
-            time.sleep(0.01)
-        raise RuntimeError("Timed out waiting for scrcpy video frame")
-
-
 def run_command(cmd: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(
         cmd,
@@ -283,6 +240,303 @@ def run_command(cmd: list[str]) -> subprocess.CompletedProcess:
         encoding="utf-8",
         errors="replace",
     )
+
+
+class ADBScreenshotSession:
+    def __init__(self, adb_path: str, serial: str | None):
+        self._adb_path = adb_path
+        self._serial = serial
+        self._latest_frame_seq = 0
+
+    def _adb_command(self, *args: str) -> list[str]:
+        command = [self._adb_path]
+        if self._serial:
+            command.extend(("-s", self._serial))
+        command.extend(args)
+        return command
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def get_frame_with_seq(
+        self,
+        timeout_sec: float,
+        min_seq_exclusive: int | None = None,
+    ) -> tuple[np.ndarray, int]:
+        try:
+            result = subprocess.run(
+                self._adb_command("exec-out", "screencap", "-p"),
+                check=False,
+                capture_output=True,
+                timeout=max(timeout_sec, 0.01),
+            )
+        except subprocess.TimeoutExpired as err:
+            raise RuntimeError(f"Timed out capturing ADB screenshot after {timeout_sec:.2f}s") from err
+
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"ADB screencap failed: {stderr or f'exit code {result.returncode}'}")
+        if not result.stdout:
+            raise RuntimeError("ADB screencap returned no image data")
+
+        frame = cv2.imdecode(np.frombuffer(result.stdout, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if frame is None or frame.ndim != 3 or frame.shape[2] != 3:
+            raise RuntimeError("ADB screencap returned an invalid PNG image")
+
+        self._latest_frame_seq += 1
+        if min_seq_exclusive is not None and self._latest_frame_seq <= min_seq_exclusive:
+            raise RuntimeError(
+                "ADB screenshot sequence did not advance "
+                f"(last_seen_seq={min_seq_exclusive})"
+            )
+        return frame, self._latest_frame_seq
+
+    def get_frame(self, timeout_sec: float) -> np.ndarray:
+        frame, _ = self.get_frame_with_seq(timeout_sec=timeout_sec)
+        return frame
+
+
+class MinitouchController:
+    _REMOTE_BINARY_PATH = "/data/local/tmp/minitouch"
+
+    def __init__(
+        self,
+        adb_path: str,
+        serial: str | None,
+        binaries_dir: Path,
+        host_port: int,
+        tap_hold_sec: float,
+        swipe_step_px: int,
+        swipe_step_delay_sec: float,
+    ):
+        self._adb_path = adb_path
+        self._serial = serial
+        self._binaries_dir = binaries_dir
+        self._host_port = host_port
+        self._tap_hold_sec = tap_hold_sec
+        self._swipe_step_px = swipe_step_px
+        self._swipe_step_delay_sec = swipe_step_delay_sec
+        self._socket: socket.socket | None = None
+        self._server_process: subprocess.Popen | None = None
+        self._max_x = 0
+        self._max_y = 0
+        self._max_pressure = 0
+        self._screen_width = 0
+        self._screen_height = 0
+        self._surface_orientation = 0
+
+    def _adb_command(self, *args: str) -> list[str]:
+        command = [self._adb_path]
+        if self._serial:
+            command.extend(("-s", self._serial))
+        command.extend(args)
+        return command
+
+    def _run_adb(self, *args: str) -> subprocess.CompletedProcess:
+        return run_command(self._adb_command(*args))
+
+    def _require_success(self, operation: str, result: subprocess.CompletedProcess) -> None:
+        if result.returncode != 0:
+            raise RuntimeError(f"{operation} failed: {result.stderr.strip() or result.stdout.strip()}")
+
+    def _resolve_binary_path(self) -> Path:
+        abi_result = self._run_adb("shell", "getprop", "ro.product.cpu.abi")
+        self._require_success("Reading Android ABI", abi_result)
+        abi = abi_result.stdout.strip()
+        if not abi:
+            raise RuntimeError("Android device did not report ro.product.cpu.abi")
+
+        binary_path = self._binaries_dir / abi / "minitouch"
+        if not binary_path.is_file():
+            raise RuntimeError(
+                f"Minitouch binary for ABI {abi!r} was not found at {binary_path}. "
+                "Add it under assets/minitouch/<abi>/minitouch."
+            )
+        return binary_path
+
+    def start(self) -> None:
+        binary_path = self._resolve_binary_path()
+        self._require_success(
+            "Pushing minitouch binary",
+            self._run_adb("push", str(binary_path), self._REMOTE_BINARY_PATH),
+        )
+        self._require_success(
+            "Making minitouch executable",
+            self._run_adb("shell", "chmod", "755", self._REMOTE_BINARY_PATH),
+        )
+
+        self._server_process = subprocess.Popen(
+            self._adb_command("shell", self._REMOTE_BINARY_PATH),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self._run_adb("forward", "--remove", f"tcp:{self._host_port}")
+        self._require_success(
+            "Forwarding minitouch socket",
+            self._run_adb("forward", f"tcp:{self._host_port}", "localabstract:minitouch"),
+        )
+        self._connect_and_read_handshake()
+        self._surface_orientation = self._read_surface_orientation()
+        logger.info(
+            "Minitouch connected: x=%d y=%d pressure=%d orientation=%d",
+            self._max_x,
+            self._max_y,
+            self._max_pressure,
+            self._surface_orientation,
+        )
+
+    def _read_surface_orientation(self) -> int:
+        result = self._run_adb("shell", "dumpsys", "input")
+        self._require_success("Reading Android display orientation", result)
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line.startswith("SurfaceOrientation:"):
+                continue
+            try:
+                orientation = int(line.partition(":")[2].strip())
+            except ValueError as err:
+                raise RuntimeError(f"Invalid Android SurfaceOrientation value: {line!r}") from err
+            if orientation not in (0, 1, 2, 3):
+                raise RuntimeError(f"Unsupported Android SurfaceOrientation value: {orientation}")
+            return orientation
+        raise RuntimeError("Android display orientation was not reported by dumpsys input")
+
+    def _connect_and_read_handshake(self) -> None:
+        deadline = time.monotonic() + 5.0
+        last_error: OSError | None = None
+        last_payload = ""
+        while time.monotonic() < deadline:
+            try:
+                connection = socket.create_connection(("127.0.0.1", self._host_port), timeout=0.5)
+                connection.settimeout(0.2)
+            except OSError as err:
+                last_error = err
+                time.sleep(0.1)
+                continue
+
+            payload = b""
+            handshake_deadline = min(deadline, time.monotonic() + 1.0)
+            try:
+                while time.monotonic() < handshake_deadline:
+                    try:
+                        chunk = connection.recv(1024)
+                    except TimeoutError:
+                        continue
+
+                    if not chunk:
+                        break
+                    payload += chunk
+
+                    for line in payload.decode("utf-8", errors="replace").splitlines():
+                        if not line.startswith("^"):
+                            continue
+                        parts = line.split()
+                        if len(parts) != 5:
+                            continue
+                        try:
+                            _, _, max_x, max_y, max_pressure = parts
+                            self._max_x = int(max_x)
+                            self._max_y = int(max_y)
+                            self._max_pressure = int(max_pressure)
+                        except ValueError:
+                            continue
+                        self._socket = connection
+                        return
+            finally:
+                if self._socket is not connection:
+                    connection.close()
+
+            last_payload = payload.decode("utf-8", errors="replace").strip()
+            time.sleep(0.1)
+
+        raise RuntimeError(
+            "Minitouch capability handshake was incomplete or invalid. "
+            f"Received: {last_payload!r}; last socket error: {last_error}"
+        )
+
+    def stop(self) -> None:
+        if self._socket is not None:
+            self._socket.close()
+            self._socket = None
+        self._run_adb("forward", "--remove", f"tcp:{self._host_port}")
+        if self._server_process is not None:
+            self._server_process.terminate()
+            try:
+                self._server_process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                self._server_process.kill()
+                self._server_process.wait()
+            self._server_process = None
+
+    def set_screen_size(self, width: int, height: int) -> None:
+        if width <= 0 or height <= 0:
+            raise ValueError("Screenshot dimensions must be positive")
+        self._screen_width = width
+        self._screen_height = height
+
+    def _normalize_point(self, x: int, y: int) -> tuple[int, int]:
+        if self._screen_width <= 0 or self._screen_height <= 0:
+            raise RuntimeError("Minitouch screen size has not been initialized")
+
+        if self._surface_orientation == 0:
+            touch_x, touch_y = x, y
+            touch_width, touch_height = self._screen_width, self._screen_height
+        elif self._surface_orientation == 1:
+            touch_x, touch_y = self._screen_height - 1 - y, x
+            touch_width, touch_height = self._screen_height, self._screen_width
+        elif self._surface_orientation == 2:
+            touch_x, touch_y = self._screen_width - 1 - x, self._screen_height - 1 - y
+            touch_width, touch_height = self._screen_width, self._screen_height
+        else:
+            touch_x, touch_y = y, self._screen_width - 1 - x
+            touch_width, touch_height = self._screen_height, self._screen_width
+
+        normalized_x = round(touch_x * self._max_x / max(touch_width - 1, 1))
+        normalized_y = round(touch_y * self._max_y / max(touch_height - 1, 1))
+        return (
+            max(0, min(self._max_x, normalized_x)),
+            max(0, min(self._max_y, normalized_y)),
+        )
+
+    def _send(self, command: str) -> None:
+        if self._socket is None:
+            raise RuntimeError("Minitouch is not connected")
+        try:
+            self._socket.sendall(command.encode("ascii"))
+        except OSError as err:
+            raise RuntimeError(f"Minitouch command failed: {err}") from err
+
+    def _touch_pressure(self) -> int:
+        return self._max_pressure // 2 if self._max_pressure > 0 else 0
+
+    def tap(self, x: int, y: int) -> None:
+        touch_x, touch_y = self._normalize_point(x, y)
+        pressure = self._touch_pressure()
+        self._send(f"d 0 {touch_x} {touch_y} {pressure}\nc\n")
+        if self._tap_hold_sec > 0:
+            time.sleep(self._tap_hold_sec)
+        self._send("u 0\nc\n")
+
+    def swipe(self, start_x: int, start_y: int, end_x: int, end_y: int) -> None:
+        start_touch_x, start_touch_y = self._normalize_point(start_x, start_y)
+        end_touch_x, end_touch_y = self._normalize_point(end_x, end_y)
+        pressure = self._touch_pressure()
+        step_count = max(1, max(abs(end_x - start_x), abs(end_y - start_y)) // self._swipe_step_px)
+
+        self._send(f"d 0 {start_touch_x} {start_touch_y} {pressure}\nc\n")
+        for step in range(1, step_count + 1):
+            fraction = step / step_count
+            touch_x = round(start_touch_x + (end_touch_x - start_touch_x) * fraction)
+            touch_y = round(start_touch_y + (end_touch_y - start_touch_y) * fraction)
+            self._send(f"m 0 {touch_x} {touch_y} {pressure}\nc\n")
+            if self._swipe_step_delay_sec > 0:
+                time.sleep(self._swipe_step_delay_sec)
+        if self._tap_hold_sec > 0:
+            time.sleep(self._tap_hold_sec)
+        self._send("u 0\nc\n")
 
 
 def ensure_adb_connection(config: Config) -> None:
@@ -307,6 +561,14 @@ def ensure_adb_connection(config: Config) -> None:
             )
     elif not online:
         raise RuntimeError("No ADB devices are online")
+    elif len(online) > 1:
+        config.emulator_serial = online[0]
+        logger.warning(
+            "Multiple ADB devices are online; automatically selected the first: %s. "
+            "Available devices: %s",
+            config.emulator_serial,
+            ", ".join(online),
+        )
 
     logger.info("ADB is ready. Online devices: %s", ", ".join(online))
 
@@ -575,7 +837,7 @@ def detect_canvas_rect(screen: np.ndarray) -> tuple[int, int, int, int]:
         best_rect = refined_rect
 
     # the inset is recorded from a 1080p screenshot
-    inset_px = max(1, round(screen_h * (4.0 / 1080.0)))
+    inset_px = max(1, round(screen_h * (2.0 / 1080.0)))
     bx, by, bw, bh = best_rect
     if bw > inset_px * 2 and bh > inset_px * 2:
         best_rect = (bx + inset_px, by + inset_px, bw - inset_px * 2, bh - inset_px * 2)
@@ -721,7 +983,8 @@ def observed_canvas_to_grid(
 
 
 def validate_and_correct_frame(
-    session: ScrcpySession,
+    session: ADBScreenshotSession,
+    touch: MinitouchController,
     canvas_rect: tuple[int, int, int, int],
     expected_grid: np.ndarray,
     palette_colors: list[PaletteColor],
@@ -732,8 +995,10 @@ def validate_and_correct_frame(
     debug_dir: Path,
     frame_index: int,
     initial_shot: np.ndarray,
-) -> tuple[int | None, np.ndarray, np.ndarray]:
+    initial_shot_seq: int,
+) -> tuple[int | None, np.ndarray, int, np.ndarray]:
     shot = initial_shot
+    shot_seq = initial_shot_seq
     observed_grid = observed_canvas_to_grid(shot, canvas_rect, palette_colors)
 
     for attempt in range(1, VALIDATION_MAX_ATTEMPTS + 1):
@@ -742,7 +1007,7 @@ def validate_and_correct_frame(
         if mismatch_count == 0:
             if attempt > 1:
                 logger.info("Frame %d validated after %d correction pass(es)", frame_index, attempt - 1)
-            return selected_color, shot, observed_grid
+            return selected_color, shot, shot_seq, observed_grid
 
         logger.warning(
             "Frame %d validation mismatch after draw: attempt=%d mismatched_pixels=%d",
@@ -764,7 +1029,7 @@ def validate_and_correct_frame(
         logger.warning("Saved mismatch debug image: %s", mismatch_path)
 
         selected_color = draw_mask_scanline(
-            session.client.control,
+            touch,
             canvas_rect,
             expected_grid,
             mismatch_mask,
@@ -775,7 +1040,10 @@ def validate_and_correct_frame(
         )
 
         time.sleep(action_delay_sec)
-        shot = session.get_frame(timeout_sec=frame_wait_timeout_sec)
+        shot, shot_seq = session.get_frame_with_seq(
+            timeout_sec=frame_wait_timeout_sec,
+            min_seq_exclusive=shot_seq,
+        )
         observed_grid = observed_canvas_to_grid(shot, canvas_rect, palette_colors)
 
     mismatch_count = int(np.count_nonzero(observed_grid != expected_grid))
@@ -818,13 +1086,12 @@ def cell_center(canvas_rect: tuple[int, int, int, int], row: int, col: int) -> t
     return px, py
 
 
-def tap(control: scrcpy.control.ControlSender, x: int, y: int) -> None:
-    control.touch(x, y, scrcpy.ACTION_DOWN)
-    control.touch(x, y, scrcpy.ACTION_UP)
+def tap(touch: MinitouchController, x: int, y: int) -> None:
+    touch.tap(x, y)
 
 
 def select_color(
-    control: scrcpy.control.ControlSender,
+    touch: MinitouchController,
     color: PaletteColor,
     selected_color: int | None,
     action_delay_sec: float,
@@ -832,13 +1099,13 @@ def select_color(
     if selected_color == color.index:
         return selected_color
 
-    tap(control, color.center[0], color.center[1])
+    tap(touch, color.center[0], color.center[1])
     time.sleep(action_delay_sec)
     return color.index
 
 
 def draw_mask_scanline(
-    control: scrcpy.control.ControlSender,
+    touch: MinitouchController,
     canvas_rect: tuple[int, int, int, int],
     target_grid: np.ndarray,
     draw_mask: np.ndarray,
@@ -867,14 +1134,14 @@ def draw_mask_scanline(
                 end_x, end_y = cell_center(canvas_rect, row, run_end)
                 run_length = run_end - run_start + 1
 
-                if run_length < 4:
+                if run_length <= 2:
                     for tap_col in range(run_start, run_end + 1):
                         tap_x, tap_y = cell_center(canvas_rect, row, tap_col)
-                        tap(control, tap_x, tap_y)
+                        tap(touch, tap_x, tap_y)
                         touch_actions.append(TouchAction(kind="tap", start=(tap_x, tap_y), end=(tap_x, tap_y)))
                         time.sleep(action_delay_sec)
                 else:
-                    control.swipe(start_x, start_y, end_x, end_y)
+                    touch.swipe(start_x, start_y, end_x, end_y)
                     touch_actions.append(
                         TouchAction(kind="swipe", start=(start_x, start_y), end=(end_x, end_y))
                     )
@@ -897,7 +1164,7 @@ def draw_mask_scanline(
 
     for color in phase_order:
         selected_color = select_color(
-            control,
+            touch,
             color,
             selected_color,
             action_delay_sec,
@@ -908,7 +1175,8 @@ def draw_mask_scanline(
 
 
 def clear_canvas(
-    session: ScrcpySession,
+    session: ADBScreenshotSession,
+    touch: MinitouchController,
     clear_button_center: tuple[int, int],
     clear_confirm_template: np.ndarray,
     score_threshold: float,
@@ -916,19 +1184,19 @@ def clear_canvas(
     confirm_timeout_sec: float,
     debug_dir: Path,
 ) -> None:
-    control = session.client.control
     logger.info("Clearing canvas")
 
-    tap(control, clear_button_center[0], clear_button_center[1])
+    tap(touch, clear_button_center[0], clear_button_center[1])
     time.sleep(action_delay_sec)
 
     confirm_begin = time.time()
     deadline = confirm_begin + confirm_timeout_sec
     confirm_center: tuple[int, int] | None = None
     last_frame: np.ndarray | None = None
+    latest_seq = -1
 
     while time.time() < deadline:
-        frame = session.get_frame(timeout_sec=1.0)
+        frame, latest_seq = session.get_frame_with_seq(timeout_sec=1.0, min_seq_exclusive=latest_seq)
         last_frame = frame
         try:
             x, y, w, h, _ = match_template_multiscale(frame, clear_confirm_template, score_threshold)
@@ -942,7 +1210,7 @@ def clear_canvas(
             save_debug_screenshot(debug_dir, last_frame, "detect_clear_confirm_failed")
         raise RuntimeError("Clear confirmation button was not detected")
 
-    tap(control, confirm_center[0], confirm_center[1])
+    tap(touch, confirm_center[0], confirm_center[1])
     confirm_transition_duration = time.time() - confirm_begin
     time.sleep(action_delay_sec + confirm_transition_duration)
     logger.info("Canvas cleared successfully")
@@ -1233,13 +1501,27 @@ def main() -> None:
     clear_screenshots_dir(config.screenshots_dir)
     clear_debug_frames_dir(config.debug_dir)
 
-    session = ScrcpySession(serial=config.emulator_serial, max_fps=int(max(30, config.draw_fps * 2)))
-    logger.info("Starting scrcpy session")
+    session = ADBScreenshotSession(
+        adb_path=config.adb_path,
+        serial=config.emulator_serial,
+    )
+    touch = MinitouchController(
+        adb_path=config.adb_path,
+        serial=config.emulator_serial,
+        binaries_dir=config.minitouch_binaries_dir,
+        host_port=config.minitouch_host_port,
+        tap_hold_sec=config.minitouch_tap_hold_sec,
+        swipe_step_px=config.minitouch_swipe_step_px,
+        swipe_step_delay_sec=config.minitouch_swipe_step_delay_sec,
+    )
+    logger.info("Starting ADB screenshot session and minitouch controller")
     session.start()
 
     try:
-        screen = session.get_frame(timeout_sec=config.frame_wait_timeout_sec)
-        logger.info("Received initial video frame")
+        touch.start()
+        screen, latest_frame_seq = session.get_frame_with_seq(timeout_sec=config.frame_wait_timeout_sec)
+        touch.set_screen_size(screen.shape[1], screen.shape[0])
+        logger.info("Received initial screenshot frame")
 
         try:
             canvas_rect = detect_canvas_rect(screen)
@@ -1317,6 +1599,7 @@ def main() -> None:
 
         clear_canvas(
             session,
+            touch,
             clear_button_center,
             clear_confirm_template,
             config.template_score_threshold,
@@ -1358,6 +1641,7 @@ def main() -> None:
                     )
                     clear_canvas(
                         session,
+                        touch,
                         clear_button_center,
                         clear_confirm_template,
                         config.template_score_threshold,
@@ -1370,7 +1654,7 @@ def main() -> None:
 
             frame_touch_actions: list[TouchAction] = []
             selected_color = draw_mask_scanline(
-                session.client.control,
+                touch,
                 canvas_rect,
                 grid,
                 draw_mask,
@@ -1381,9 +1665,13 @@ def main() -> None:
             )
 
             time.sleep(config.action_delay_sec)
-            shot = session.get_frame(timeout_sec=config.frame_wait_timeout_sec)
-            selected_color, shot, prev_grid = validate_and_correct_frame(
+            shot, latest_frame_seq = session.get_frame_with_seq(
+                timeout_sec=config.frame_wait_timeout_sec,
+                min_seq_exclusive=latest_frame_seq,
+            )
+            selected_color, shot, latest_frame_seq, prev_grid = validate_and_correct_frame(
                 session,
+                touch,
                 canvas_rect,
                 grid,
                 palette_colors,
@@ -1394,6 +1682,7 @@ def main() -> None:
                 config.debug_dir,
                 i,
                 shot,
+                latest_frame_seq,
             )
             screenshot_path = config.screenshots_dir / f"frame_{i:06d}.png"
             write_frame_image(screenshot_path, shot)
@@ -1419,7 +1708,8 @@ def main() -> None:
         logger.exception("Automation failed")
         raise
     finally:
-        logger.info("Stopping scrcpy session")
+        logger.info("Stopping minitouch controller and ADB screenshot session")
+        touch.stop()
         session.stop()
 
 

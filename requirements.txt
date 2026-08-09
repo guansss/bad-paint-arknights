@@ -1,7 +1,2 @@
 numpy
 opencv-python>=4.5.3,<5.0.0
-adbutils>=0.14.1,<0.15.0
-av
-# scrcpy-client must be installed with --no-deps due to its outdated av<10 constraint
-# (av 9.x has no pre-built wheel for Python 3.11): pip install scrcpy-client --no-deps
-scrcpy-client
