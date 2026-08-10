@@ -1,13 +1,12 @@
 # bad-paint-arknights
 
-`bad-paint-arknights` is a Python script that drives an Android emulator with ADB, reads frames from a source video, and recreates them in Arknights' Exhibition Gallery painting scene frame by frame. It captures screenshots after each frame and can compile the result into `output.mp4`.
+`bad-paint-arknights` is a Python script that drives an Android emulator with ADB, reads frames from a source video, and recreates them in Arknights' Interactive Exhibition painting scene frame by frame. It captures screenshots after each frame and can compile the result into `output.mp4`.
 
 ## Requirements
 
 - Python 3 with the packages in `requirements.txt`
 - `adb`, `ffmpeg`, and `ffprobe` available on your PATH, or configured in `config.json`
 - ABI-matched minitouch binaries (see below)
-- A source video placed in `assets/`
 
 #### minitouch
 
@@ -43,13 +42,15 @@ Alternatively, if you already have MaaAssistantArknights installed, you can chan
    ```
 
 2. Copy `config.example.json` to `config.json` and adjust options if needed.
-3. Put the source video in `assets/`.
+3. It's recommended to set your emulator to a resolution of 1920x1080 and a higher FPS (>= 30) for best results. Other resolutions are not tested and not guaranteed to work.
 
 ## Usage
 
-Make sure your Android emulator or device is running with Arknights open and navigated to the Exhibition Gallery painting scene:
+Make sure your Android emulator or device is running with Arknights open and navigated to the Interactive Exhibition painting scene:
 
-![Exhibition Gallery painting scene](assets/guide/paiting-scene.png)
+![Interactive Exhibition painting scene](assets/guide/paiting-scene.png)
+
+Put your source video in `assets/`. The script will automatically detect the first video file in that directory.
 
 Then, run the script from the project root:
 
