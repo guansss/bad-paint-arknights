@@ -1,7 +1,6 @@
 config.json
-assets/*.mp4
+*.mp4
 debug/
 screenshots/
-output.mp4
 __pycache__/
 .venv/

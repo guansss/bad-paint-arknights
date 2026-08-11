@@ -54,7 +54,6 @@ class Config:
 
     adb_path: str = "adb"
     ffmpeg_path: str = "ffmpeg"
-    ffprobe_path: str = "ffprobe"
     emulator_serial: str | None = None
     minitouch_binaries_dir: Path | None = None
     minitouch_host_port: int = 1111
@@ -115,8 +114,6 @@ def load_config_from_json(project_root: Path) -> Config:
         config.adb_path = str(data["adb_path"])
     if "ffmpeg_path" in data:
         config.ffmpeg_path = str(data["ffmpeg_path"])
-    if "ffprobe_path" in data:
-        config.ffprobe_path = str(data["ffprobe_path"])
     if "emulator_serial" in data:
         config.emulator_serial = data["emulator_serial"]
     if "minitouch_binaries_dir" in data:
@@ -1434,78 +1431,154 @@ def save_mismatch_debug_image(
     return path
 
 
-def source_has_audio(ffprobe_path: str, source_video: Path) -> bool:
+def resolve_ffmpeg_path(ffmpeg_path: str | None) -> str | None:
+    if ffmpeg_path is None:
+        return None
+
+    value = str(ffmpeg_path).strip()
+    if not value or value.lower() == "none":
+        return None
+
+    resolved = shutil.which(value)
+    if resolved:
+        return resolved
+
+    path = Path(value)
+    if path.exists() and path.is_file():
+        return str(path)
+
+    return None
+
+
+def source_has_audio(ffmpeg_path: str | None, source_video: Path) -> bool:
+    if ffmpeg_path is None:
+        return False
+
     cmd = [
-        ffprobe_path,
+        ffmpeg_path,
         "-v",
         "error",
-        "-select_streams",
-        "a",
-        "-show_entries",
-        "stream=index",
-        "-of",
-        "csv=p=0",
+        "-i",
         str(source_video),
+        "-map",
+        "0:a",
+        "-f",
+        "null",
+        "-",
     ]
     result = run_command(cmd)
-    if result.returncode != 0:
-        return False
-    return bool(result.stdout.strip())
+    return result.returncode == 0
+
+
+def compile_output_video_opencv(config: Config) -> None:
+    logger.info("Compiling output video with OpenCV fallback: %s", config.output_video_path)
+    config.output_video_path.parent.mkdir(parents=True, exist_ok=True)
+
+    frame_paths = sorted(config.screenshots_dir.glob("frame_*.png"))
+    if not frame_paths:
+        raise RuntimeError(f"No screenshot frames were found in {config.screenshots_dir}")
+
+    first_frame = cv2.imread(str(frame_paths[0]), cv2.IMREAD_COLOR)
+    if first_frame is None:
+        raise RuntimeError(f"Failed to read first frame: {frame_paths[0]}")
+
+    height, width = first_frame.shape[:2]
+    writer = cv2.VideoWriter(
+        str(config.output_video_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        float(config.draw_fps),
+        (width, height),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"OpenCV could not open a writer for {config.output_video_path}")
+
+    try:
+        for path in frame_paths:
+            frame = cv2.imread(str(path), cv2.IMREAD_COLOR)
+            if frame is None:
+                logger.warning("Skipping unreadable screenshot: %s", path)
+                continue
+            if frame.shape[:2] != (height, width):
+                frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_LINEAR)
+            writer.write(frame)
+    finally:
+        writer.release()
+
+    if not config.output_video_path.exists() or config.output_video_path.stat().st_size == 0:
+        raise RuntimeError(f"OpenCV fallback failed to generate video: {config.output_video_path}")
+
+    logger.info("Output video generated with OpenCV fallback: %s", config.output_video_path)
 
 
 def compile_output_video(config: Config, source_video: Path) -> None:
+    ffmpeg_path = resolve_ffmpeg_path(config.ffmpeg_path)
+    if ffmpeg_path is None:
+        logger.warning(
+            "ffmpeg is not configured or unavailable; using silent OpenCV fallback for %s",
+            config.output_video_path,
+        )
+        compile_output_video_opencv(config)
+        return
+
     logger.info("Compiling output video: %s", config.output_video_path)
     image_input = str(config.screenshots_dir / "frame_%06d.png")
 
-    if source_has_audio(config.ffprobe_path, source_video):
-        cmd = [
-            config.ffmpeg_path,
-            "-y",
-            "-framerate",
-            str(config.draw_fps),
-            "-i",
-            image_input,
-            "-i",
-            str(source_video),
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:a:0",
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-shortest",
-            str(config.output_video_path),
-        ]
-    else:
-        cmd = [
-            config.ffmpeg_path,
-            "-y",
-            "-framerate",
-            str(config.draw_fps),
-            "-i",
-            image_input,
-            "-f",
-            "lavfi",
-            "-i",
-            "anullsrc=channel_layout=stereo:sample_rate=44100",
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-shortest",
-            str(config.output_video_path),
-        ]
+    try:
+        if source_has_audio(ffmpeg_path, source_video):
+            cmd = [
+                ffmpeg_path,
+                "-y",
+                "-framerate",
+                str(config.draw_fps),
+                "-i",
+                image_input,
+                "-i",
+                str(source_video),
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-shortest",
+                str(config.output_video_path),
+            ]
+        else:
+            cmd = [
+                ffmpeg_path,
+                "-y",
+                "-framerate",
+                str(config.draw_fps),
+                "-i",
+                image_input,
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=channel_layout=stereo:sample_rate=44100",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-shortest",
+                str(config.output_video_path),
+            ]
 
-    result = run_command(cmd)
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed: {result.stderr.strip()}")
-    logger.info("Output video generated: %s", config.output_video_path)
+        result = run_command(cmd)
+        if result.returncode == 0:
+            logger.info("Output video generated: %s", config.output_video_path)
+            return
+
+        logger.warning("ffmpeg failed: %s; falling back to OpenCV silent output", result.stderr.strip())
+    except FileNotFoundError:
+        logger.warning("ffmpeg executable was missing; falling back to OpenCV silent output")
+
+    compile_output_video_opencv(config)
 
 
 def load_templates(config: Config) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

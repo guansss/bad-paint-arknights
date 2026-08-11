@@ -5,10 +5,14 @@
 ## Requirements
 
 - Python 3 with the packages in `requirements.txt`
-- `adb`, `ffmpeg`, and `ffprobe` available on your PATH, or configured in `config.json`
+- `adb` and `ffmpeg` (optional) available on your PATH or configured in `config.json`
 - ABI-matched minitouch binaries (see below)
 
-#### minitouch
+### ffmpeg
+
+ffmpeg is optional. The script uses it to compile the captured screenshots into a video, combining the original audio from the source video. If ffmpeg is not available, the script will use OpenCV as a fallback, but then the resulting video will not have audio, and you'll need to manually add the audio track later in some video editing software.
+
+### minitouch
 
 minitouch itself does not provide prebuilt binaries. You can either build them yourself or download them from somewhere. A recommended source is [MaaAssistantArknights](https://github.com/MaaAssistantArknights/MaaAssistantArknights/tree/dev-v2/resource/minitouch). After downloading, place them under `assets/minitouch/`, and the file structure should look like this:
 
@@ -25,11 +29,21 @@ assets/
         └── minitouch
 ```
 
-Alternatively, if you already have MaaAssistantArknights installed, you can change the `minitouch_binaries_dir` in `config.json` to point to its `minitouch` directory, for example:
+### Quick access if you have MaaAssistantArknights (MAA) installed
 
-```jsonc
-"minitouch_binaries_dir": "D:/MAA/resource/minitouch",
-```
+If you already have MAA installed, you can set up adb and minitouch easily.
+
+1. Go to MAA's Settings > Connection Settings > ADB Path, copy the path and paste it into `config.json`. For example:
+
+   ```jsonc
+   "adb_path": "C:\\Program Files\\Netease\\MuMuPlayer-12.0\\shell\\.\\adb.exe",
+   ```
+
+2. Set the `minitouch_binaries_dir` to point to MAA's `minitouch` directory. For example:
+
+   ```jsonc
+   "minitouch_binaries_dir": "D:/MAA/resource/minitouch",
+   ```
 
 ## Setup
 
@@ -79,7 +93,6 @@ The script will:
   "output_video_path": "output.mp4",
   "adb_path": "adb",
   "ffmpeg_path": "ffmpeg",
-  "ffprobe_path": "ffprobe",
 
   // The emulator serial to connect to. If null, the first available device will be used.
   "emulator_serial": null,
