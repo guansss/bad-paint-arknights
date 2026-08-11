@@ -2,6 +2,8 @@
 
 `bad-paint-arknights` is a Python script that drives an Android emulator with ADB, reads frames from a source video, and recreates them in Arknights' Interactive Exhibition painting scene frame by frame. It captures screenshots after each frame and can compile the result into `output.mp4`.
 
+Demo: [Bad Apple!!](https://www.bilibili.com/video/BV1bAuX6WEgN)
+
 ## Requirements
 
 - Python 3 with the packages in `requirements.txt`
